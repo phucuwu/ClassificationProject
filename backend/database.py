@@ -212,6 +212,55 @@ def update_sample_reviews(
         conn.close()
 
 
+def delete_samples(
+    sample_ids: list[int],
+    db_path: Path | str | None = None,
+) -> tuple[int, list[str]]:
+    """Delete samples by IDs from the database and remove local image files.
+
+    Args:
+        sample_ids: List of integer sample IDs to delete.
+        db_path: Optional path to SQLite database file.
+
+    Returns:
+        Tuple of (number of deleted rows, list of file paths removed).
+    """
+    if not sample_ids:
+        return 0, []
+
+    conn = get_db_connection(db_path)
+    try:
+        placeholders = ",".join("?" for _ in sample_ids)
+        with conn:
+            cursor = conn.execute(
+                f"SELECT id, file_path FROM samples WHERE id IN ({placeholders});",
+                sample_ids,
+            )
+            rows = cursor.fetchall()
+            file_paths = [row["file_path"] for row in rows]
+
+            del_cursor = conn.execute(
+                f"DELETE FROM samples WHERE id IN ({placeholders});",
+                sample_ids,
+            )
+            deleted_count = del_cursor.rowcount
+
+        # Clean up local image files if they exist
+        for rel_path in file_paths:
+            p = Path(rel_path)
+            if not p.is_absolute():
+                p = PROJECT_ROOT / p
+            if p.exists() and p.is_file():
+                try:
+                    p.unlink()
+                except OSError:
+                    pass
+
+        return deleted_count, file_paths
+    finally:
+        conn.close()
+
+
 def load_training_matrix(
     db_path: Path | str | None = None,
 ) -> tuple[np.ndarray, np.ndarray]:

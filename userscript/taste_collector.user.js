@@ -4,7 +4,10 @@
 // @version      1.1.0
 // @description  Local art taste collector with Manual, Supervised, and Full Auto modes
 // @author       Antigravity
-// @match        *://*/*
+// @match        https://*.tinder.com/*
+// @match        https://tinder.com/*
+// @match        http://*.tinder.com/*
+// @match        http://tinder.com/*
 // @grant        GM_xmlhttpRequest
 // @grant        GM_setValue
 // @grant        GM_getValue
@@ -16,6 +19,12 @@
 
 (function () {
   "use strict";
+
+  // Restrict execution strictly to tinder.com
+  const hostname = window.location.hostname.toLowerCase();
+  if (hostname !== "tinder.com" && !hostname.endsWith(".tinder.com")) {
+    return;
+  }
 
   // ---------------------------------------------------------------------------
   // Configuration
@@ -32,6 +41,7 @@
   let currentMode = "manual"; // 'manual', 'supervised', 'auto'
   let isProcessing = false;
   let autoModeTimer = null;
+  let lastAutoActionTime = 0;
   let supervisedPendingData = null;
 
   // ---------------------------------------------------------------------------
@@ -168,81 +178,28 @@
   }
 
   // ---------------------------------------------------------------------------
-  // Action Dispatcher (Native Button Click + Arrow Key Events)
+  // Action Dispatcher (Arrow Key Signals)
   // ---------------------------------------------------------------------------
-  function findActionButton(actionType) {
-    // 1. Check aria-labels or inner text
-    const searchTerms = actionType === "like"
-      ? ["like", "yes", "heart", "approve"]
-      : ["nope", "pass", "dislike", "no", "dismiss", "close"];
-
-    const allButtons = Array.from(document.querySelectorAll("button, [role='button']"));
-
-    // Find by aria-label
-    let target = allButtons.find((btn) => {
-      const label = (btn.getAttribute("aria-label") || "").toLowerCase();
-      return searchTerms.some((term) => label.includes(term));
-    });
-    if (target) return target;
-
-    // Find by child SVG or class containing gamepad icons (common on card swipe interfaces)
-    const gamepadButtons = allButtons.filter((btn) =>
-      btn.querySelector("svg") || btn.className.includes("button") || btn.className.includes("Bgc")
-    );
-
-    if (actionType === "like" && gamepadButtons.length >= 2) {
-      // Like is typically the rightmost/last button among the primary action pair
-      return gamepadButtons[gamepadButtons.length - 1];
-    } else if (actionType === "dislike" && gamepadButtons.length >= 2) {
-      // Dislike is typically the leftmost button among the primary action pair
-      return gamepadButtons[0];
-    }
-
-    return null;
+  function sendKeySignal(key, code, keyCode) {
+    const eventOptions = {
+      key: key,
+      code: code,
+      keyCode: keyCode,
+      which: keyCode,
+      bubbles: true,
+      cancelable: true,
+      view: window,
+    };
+    document.dispatchEvent(new KeyboardEvent("keydown", eventOptions));
+    document.dispatchEvent(new KeyboardEvent("keyup", eventOptions));
   }
 
   function dispatchDislikeAction() {
-    const btn = findActionButton("dislike");
-    if (btn) {
-      btn.click();
-      return;
-    }
-
-    const eventOptions = {
-      key: "ArrowLeft",
-      code: "ArrowLeft",
-      keyCode: 37,
-      which: 37,
-      bubbles: true,
-      cancelable: true,
-      view: window,
-    };
-    document.dispatchEvent(new KeyboardEvent("keydown", eventOptions));
-    document.dispatchEvent(new KeyboardEvent("keyup", eventOptions));
-    window.dispatchEvent(new KeyboardEvent("keydown", eventOptions));
-    window.dispatchEvent(new KeyboardEvent("keyup", eventOptions));
+    sendKeySignal("ArrowLeft", "ArrowLeft", 37);
   }
 
   function dispatchLikeAction() {
-    const btn = findActionButton("like");
-    if (btn) {
-      btn.click();
-      return;
-    }
-
-    const eventOptions = {
-      key: "ArrowRight",
-      code: "ArrowRight",
-      keyCode: 39,
-      which: 39,
-      bubbles: true,
-      cancelable: true,
-      view: window,
-    };
-    document.dispatchEvent(new KeyboardEvent("keydown", eventOptions));
-    document.dispatchEvent(new KeyboardEvent("keyup", eventOptions));
-    window.dispatchEvent(new KeyboardEvent("keydown", eventOptions));
-    window.dispatchEvent(new KeyboardEvent("keyup", eventOptions));
+    sendKeySignal("ArrowRight", "ArrowRight", 39);
   }
 
   // ---------------------------------------------------------------------------
@@ -653,13 +610,24 @@
     if (currentMode !== "auto") return;
 
     try {
+      // Enforce rate limit: wait at least 1 second between consecutive ratings
+      const now = Date.now();
+      const timeSinceLastAction = now - lastAutoActionTime;
+      if (timeSinceLastAction < CONFIG.autoModeDelayMs) {
+        const remainingWait = CONFIG.autoModeDelayMs - timeSinceLastAction;
+        autoModeTimer = setTimeout(runFullAutoStep, remainingWait);
+        return;
+      }
+
       const extracted = await extractActiveArtworkImage();
       if (!extracted || !extracted.imageBase64) {
-        autoModeTimer = setTimeout(runFullAutoStep, CONFIG.autoModeDelayMs);
+        autoModeTimer = setTimeout(runFullAutoStep, 500);
         return;
       }
 
       const pred = await sendPredictSample(extracted.imageBase64);
+
+      if (currentMode !== "auto") return;
 
       if (!pred.model_loaded) {
         alert("Model not trained yet! Please gather ratings in Manual Mode first.");
@@ -680,13 +648,15 @@
         image_set_count: extracted.imageSetCount,
       });
 
+      lastAutoActionTime = Date.now();
       if (decision === 1) dispatchLikeAction();
       else dispatchDislikeAction();
 
+      // Wait at least 1 second before processing the next artwork
       autoModeTimer = setTimeout(runFullAutoStep, CONFIG.autoModeDelayMs);
     } catch (err) {
       console.error("Auto mode error:", err);
-      autoModeTimer = setTimeout(runFullAutoStep, CONFIG.autoModeDelayMs * 2);
+      autoModeTimer = setTimeout(runFullAutoStep, Math.max(CONFIG.autoModeDelayMs, 1000));
     }
   }
 
@@ -769,6 +739,11 @@
   // Global Keyboard Listener
   // ---------------------------------------------------------------------------
   window.addEventListener("keydown", (e) => {
+    // Only process trusted user keystrokes; let synthetic key signals pass to the library
+    if (!e.isTrusted) {
+      return;
+    }
+
     // Ignore input fields
     if (["INPUT", "TEXTAREA", "SELECT"].includes(document.activeElement.tagName)) {
       return;
@@ -776,6 +751,10 @@
 
     if (e.key === "s" || e.key === "S") {
       e.preventDefault();
+      if (autoModeTimer) {
+        clearTimeout(autoModeTimer);
+        autoModeTimer = null;
+      }
       if (currentMode === "supervised") {
         currentMode = "manual";
       } else {
@@ -787,7 +766,10 @@
       e.preventDefault();
       if (currentMode === "auto") {
         currentMode = "manual";
-        if (autoModeTimer) clearTimeout(autoModeTimer);
+        if (autoModeTimer) {
+          clearTimeout(autoModeTimer);
+          autoModeTimer = null;
+        }
       } else {
         currentMode = "auto";
         runFullAutoStep();

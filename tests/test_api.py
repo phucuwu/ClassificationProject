@@ -140,7 +140,19 @@ def test_api_endpoints_end_to_end():
             assert isinstance(pred_data2["prediction_score"], float)
             assert pred_data2["decision"] in (0, 1)
 
-            # 9. Test GET /api/metrics
+            # 9. Test POST /api/threshold (Update active decision threshold)
+            thresh_resp = client.post("/api/threshold", json={"threshold": 0.42})
+            assert thresh_resp.status_code == 200
+            thresh_data = thresh_resp.json()
+            assert thresh_data["success"] is True
+            assert thresh_data["decision_threshold"] == 0.42
+
+            # 10. Test POST /api/train with custom threshold override
+            train_custom_resp = client.post("/api/train", json={"threshold": 0.28})
+            assert train_custom_resp.status_code == 200
+            assert train_custom_resp.json()["metrics"]["decision_threshold"] == 0.28
+
+            # 11. Test GET /api/metrics
             metrics_resp = client.get("/api/metrics")
             assert metrics_resp.status_code == 200
             metrics_data = metrics_resp.json()
@@ -148,6 +160,21 @@ def test_api_endpoints_end_to_end():
             assert "model_status" in metrics_data
             assert metrics_data["statistics"]["total_samples"] == 3
             assert metrics_data["model_status"]["model_loaded"] is True
+            assert metrics_data["model_status"]["decision_threshold"] == 0.28
+
+            # 12. Test DELETE /api/samples/{id}
+            del_resp1 = client.delete(f"/api/samples/{id1}")
+            assert del_resp1.status_code == 200
+            assert del_resp1.json()["status"] == "success"
+
+            # 13. Test POST /api/samples/batch-delete
+            del_resp2 = client.post("/api/samples/batch-delete", json={"ids": [id2, id3]})
+            assert del_resp2.status_code == 200
+            assert del_resp2.json()["deleted_count"] == 2
+
+            # Verify samples empty
+            metrics_after = client.get("/api/metrics").json()
+            assert metrics_after["statistics"]["total_samples"] == 0
 
         finally:
             db_mod.DEFAULT_DB_PATH = orig_db

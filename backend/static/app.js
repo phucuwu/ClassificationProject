@@ -3,6 +3,7 @@ let reviewQueueSamples = [];
 let consoleLogs = [];
 let selectedCardIndex = 0;
 let activeTab = "tab-review";
+let selectedSampleIds = new Set();
 
 document.addEventListener("DOMContentLoaded", () => {
   initTabs();
@@ -74,6 +75,21 @@ function initEventListeners() {
   if (sampleLabelFilter) sampleLabelFilter.addEventListener("change", fetchDatasetSamples);
   if (refreshSamplesBtn) refreshSamplesBtn.addEventListener("click", fetchDatasetSamples);
 
+  // Batch Selection Controls
+  const selectAllBtn = document.getElementById("btn-select-all-samples");
+  const deselectAllBtn = document.getElementById("btn-deselect-all-samples");
+  const deleteSelectedBtn = document.getElementById("btn-delete-selected-samples");
+
+  if (selectAllBtn) {
+    selectAllBtn.addEventListener("click", handleSelectAllSamples);
+  }
+  if (deselectAllBtn) {
+    deselectAllBtn.addEventListener("click", handleDeselectAllSamples);
+  }
+  if (deleteSelectedBtn) {
+    deleteSelectedBtn.addEventListener("click", handleBatchDeleteSamples);
+  }
+
   // Retrain Model Button
   const retrainBtn = document.getElementById("btn-retrain");
   if (retrainBtn) {
@@ -82,10 +98,30 @@ function initEventListeners() {
 
   // Threshold Slider
   const thresholdSlider = document.getElementById("slider-threshold");
+  let thresholdDebounceTimer = null;
   if (thresholdSlider) {
     thresholdSlider.addEventListener("input", (e) => {
       const val = parseFloat(e.target.value).toFixed(2);
       document.getElementById("display-threshold-val").textContent = val;
+
+      if (thresholdDebounceTimer) clearTimeout(thresholdDebounceTimer);
+      thresholdDebounceTimer = setTimeout(async () => {
+        try {
+          const res = await fetch("/api/threshold", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ threshold: parseFloat(val) }),
+          });
+          if (!res.ok) throw new Error("Failed to update threshold");
+          const data = await res.json();
+          if (data.metrics) {
+            updateMetricsDisplay(data.metrics);
+          }
+          showToast(`Active threshold updated to θ=${val}`);
+        } catch (err) {
+          console.error("Error updating threshold:", err);
+        }
+      }, 250);
     });
   }
 
@@ -207,6 +243,7 @@ async function fetchDatasetSamples() {
     if (!res.ok) throw new Error("Failed to fetch samples");
     currentSamples = await res.json();
     renderSamplesGrid();
+    updateBatchSelectionUI();
   } catch (err) {
     console.error("Error loading samples:", err);
   }
@@ -311,12 +348,14 @@ function renderReviewGrid() {
     const card = document.createElement("div");
     card.className = `artwork-card ${idx === selectedCardIndex ? "selected" : ""}`;
     card.dataset.index = idx;
+    card.dataset.id = sample.id;
 
     const isLike = sample.label === 1;
     const scoreVal = sample.prediction_score !== null ? (sample.prediction_score * 100).toFixed(0) : "N/A";
 
     card.innerHTML = `
       <div class="card-media">
+        <button class="card-delete-btn" data-id="${sample.id}" title="Delete sample #${sample.id}" aria-label="Delete sample">✕</button>
         <img src="${sample.image_base64 || ''}" alt="Artwork" loading="lazy">
         <div class="badge-overlay ${sample.prediction_score >= 0.35 ? 'badge-like' : 'badge-dislike'}">
           ${scoreVal}% Conf
@@ -334,13 +373,18 @@ function renderReviewGrid() {
       </div>
     `;
 
-    // Click on card selects it
+    // Click on card selects it and toggles label
     card.addEventListener("click", (e) => {
       selectedCardIndex = idx;
       updateSelectedCardHighlight();
-
-      // If button or card clicked, toggle label
       toggleSampleLabel(sample.id);
+    });
+
+    // Delete single sample directly from review queue
+    const deleteBtn = card.querySelector(".card-delete-btn");
+    deleteBtn.addEventListener("click", (e) => {
+      e.stopPropagation();
+      handleDeleteSingleSample(sample.id, true);
     });
 
     grid.appendChild(card);
@@ -357,12 +401,19 @@ function renderSamplesGrid() {
   }
 
   currentSamples.forEach((sample) => {
+    const isSelected = selectedSampleIds.has(sample.id);
     const card = document.createElement("div");
-    card.className = "artwork-card";
+    card.className = `artwork-card ${isSelected ? "is-selected" : ""}`;
+    card.dataset.id = sample.id;
     const isLike = sample.label === 1;
 
     card.innerHTML = `
       <div class="card-media">
+        <label class="card-select-wrap" title="Select sample #${sample.id}">
+          <input type="checkbox" class="card-checkbox" data-id="${sample.id}" ${isSelected ? "checked" : ""}>
+          <span class="custom-checkbox"></span>
+        </label>
+        <button class="card-delete-btn" data-id="${sample.id}" title="Delete sample #${sample.id}" aria-label="Delete sample">✕</button>
         <img src="${sample.image_base64 || ''}" alt="Artwork" loading="lazy">
         <div class="badge-overlay ${isLike ? 'badge-like' : 'badge-dislike'}">
           ${isLike ? 'LIKE' : 'DISLIKE'}
@@ -379,25 +430,149 @@ function renderSamplesGrid() {
         </div>
       </div>
     `;
+
+    // Checkbox interaction
+    const checkbox = card.querySelector(".card-checkbox");
+    checkbox.addEventListener("click", (e) => {
+      e.stopPropagation();
+    });
+    checkbox.addEventListener("change", (e) => {
+      toggleSampleSelection(sample.id, e.target.checked);
+    });
+
+    // Delete single sample button
+    const deleteBtn = card.querySelector(".card-delete-btn");
+    deleteBtn.addEventListener("click", (e) => {
+      e.stopPropagation();
+      handleDeleteSingleSample(sample.id, false);
+    });
+
+    // Clicking card toggles selection
+    card.addEventListener("click", () => {
+      const willSelect = !selectedSampleIds.has(sample.id);
+      toggleSampleSelection(sample.id, willSelect);
+    });
+
     grid.appendChild(card);
   });
 }
 
-function renderModelTab(model, stats) {
-  const metricsDisplay = document.getElementById("model-metrics-display");
+function toggleSampleSelection(sampleId, isSelected) {
+  if (isSelected === undefined) {
+    isSelected = !selectedSampleIds.has(sampleId);
+  }
+  if (isSelected) {
+    selectedSampleIds.add(sampleId);
+  } else {
+    selectedSampleIds.delete(sampleId);
+  }
+  updateCardSelectionClasses();
+  updateBatchSelectionUI();
+}
 
-  if (!model.model_loaded || !model.metrics) {
-    metricsDisplay.innerHTML = `
-      <div class="empty-state" style="padding: 2rem 1rem;">
-        <div class="empty-icon">📊</div>
-        <h4>Model Not Trained Yet</h4>
-        <p>Gather initial ratings in Manual Mode on the library site, then click "Retrain Model" below.</p>
-      </div>
-    `;
-    return;
+function handleSelectAllSamples() {
+  currentSamples.forEach((sample) => {
+    selectedSampleIds.add(sample.id);
+  });
+  updateCardSelectionClasses();
+  updateBatchSelectionUI();
+}
+
+function handleDeselectAllSamples() {
+  selectedSampleIds.clear();
+  updateCardSelectionClasses();
+  updateBatchSelectionUI();
+}
+
+function updateCardSelectionClasses() {
+  const cards = document.querySelectorAll("#samples-grid .artwork-card");
+  cards.forEach((card) => {
+    const id = parseInt(card.dataset.id, 10);
+    const checkbox = card.querySelector(".card-checkbox");
+    if (selectedSampleIds.has(id)) {
+      card.classList.add("is-selected");
+      if (checkbox) checkbox.checked = true;
+    } else {
+      card.classList.remove("is-selected");
+      if (checkbox) checkbox.checked = false;
+    }
+  });
+}
+
+function updateBatchSelectionUI() {
+  const count = selectedSampleIds.size;
+  const countEl = document.getElementById("selected-samples-count");
+  if (countEl) countEl.textContent = count;
+
+  const deleteBtn = document.getElementById("btn-delete-selected-samples");
+  const deselectBtn = document.getElementById("btn-deselect-all-samples");
+
+  if (deleteBtn) {
+    if (count > 0) {
+      deleteBtn.classList.remove("hidden");
+    } else {
+      deleteBtn.classList.add("hidden");
+    }
   }
 
-  const m = model.metrics;
+  if (deselectBtn) {
+    if (count > 0) {
+      deselectBtn.classList.remove("hidden");
+    } else {
+      deselectBtn.classList.add("hidden");
+    }
+  }
+}
+
+async function handleDeleteSingleSample(sampleId, fromReviewQueue = false) {
+  try {
+    const res = await fetch(`/api/samples/${sampleId}`, { method: "DELETE" });
+    if (!res.ok) throw new Error("Failed to delete sample");
+
+    selectedSampleIds.delete(sampleId);
+    showToast(`Sample #${sampleId} deleted`);
+
+    if (fromReviewQueue) {
+      await fetchReviewQueue();
+      await fetchMetrics();
+    } else {
+      await fetchDatasetSamples();
+      await fetchMetrics();
+    }
+  } catch (err) {
+    console.error("Error deleting sample:", err);
+    showToast(`Failed to delete sample #${sampleId}`, true);
+  }
+}
+
+async function handleBatchDeleteSamples() {
+  if (selectedSampleIds.size === 0) return;
+  const ids = Array.from(selectedSampleIds);
+
+  try {
+    const res = await fetch("/api/samples/batch-delete", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ ids }),
+    });
+
+    if (!res.ok) throw new Error("Failed to delete selected samples");
+    const data = await res.json();
+
+    selectedSampleIds.clear();
+    showToast(`Deleted ${data.deleted_count} sample(s)`);
+    await fetchDatasetSamples();
+    await fetchMetrics();
+  } catch (err) {
+    console.error("Error batch deleting samples:", err);
+    showToast("Failed to delete selected samples", true);
+  }
+}
+
+function updateMetricsDisplay(m) {
+  const metricsDisplay = document.getElementById("model-metrics-display");
+  if (!metricsDisplay || !m) return;
+
   metricsDisplay.innerHTML = `
     <div class="metrics-stat-grid">
       <div class="stat-box">
@@ -419,21 +594,42 @@ function renderModelTab(model, stats) {
     </div>
   `;
 
-  // Update slider default value
-  if (model.decision_threshold !== undefined && model.decision_threshold !== null) {
-    const slider = document.getElementById("slider-threshold");
+  // Update Confusion Matrix cells
+  if (m.confusion_matrix) {
+    const cm = m.confusion_matrix;
+    const tpEl = document.getElementById("cell-tp");
+    const fpEl = document.getElementById("cell-fp");
+    const fnEl = document.getElementById("cell-fn");
+    const tnEl = document.getElementById("cell-tn");
+    if (tpEl) tpEl.textContent = cm.true_positives || 0;
+    if (fpEl) fpEl.textContent = cm.false_positives || 0;
+    if (fnEl) fnEl.textContent = cm.false_negatives || 0;
+    if (tnEl) tnEl.textContent = cm.true_negatives || 0;
+  }
+}
+
+function renderModelTab(model, stats) {
+  const metricsDisplay = document.getElementById("model-metrics-display");
+
+  if (!model.model_loaded || !model.metrics) {
+    metricsDisplay.innerHTML = `
+      <div class="empty-state" style="padding: 2rem 1rem;">
+        <div class="empty-icon">📊</div>
+        <h4>Model Not Trained Yet</h4>
+        <p>Gather initial ratings in Manual Mode on the library site, then click "Retrain Model" below.</p>
+      </div>
+    `;
+    return;
+  }
+
+  updateMetricsDisplay(model.metrics);
+
+  // Update slider default value only if user is not actively adjusting it
+  const slider = document.getElementById("slider-threshold");
+  if (slider && document.activeElement !== slider && model.decision_threshold !== undefined && model.decision_threshold !== null) {
     const formatted = parseFloat(model.decision_threshold).toFixed(2);
     slider.value = formatted;
     document.getElementById("display-threshold-val").textContent = formatted;
-  }
-
-  // Update Confusion Matrix
-  if (m.confusion_matrix) {
-    const cm = m.confusion_matrix;
-    document.getElementById("cell-tp").textContent = cm.true_positives || 0;
-    document.getElementById("cell-fp").textContent = cm.false_positives || 0;
-    document.getElementById("cell-fn").textContent = cm.false_negatives || 0;
-    document.getElementById("cell-tn").textContent = cm.true_negatives || 0;
   }
 }
 
@@ -504,6 +700,8 @@ async function confirmAllReviewItems() {
 async function handleRetrainModel() {
   const btn = document.getElementById("btn-retrain");
   const targetRecall = parseFloat(document.getElementById("input-target-recall").value) || 0.90;
+  const thresholdSlider = document.getElementById("slider-threshold");
+  const currentThreshold = thresholdSlider ? parseFloat(thresholdSlider.value) : null;
 
   btn.disabled = true;
   btn.textContent = "⏳ Training Model...";
@@ -512,14 +710,17 @@ async function handleRetrainModel() {
     const res = await fetch("/api/train", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ target_recall: targetRecall }),
+      body: JSON.stringify({
+        target_recall: targetRecall,
+        threshold: currentThreshold,
+      }),
     });
 
     const data = await res.json();
     if (data.status === "insufficient_data") {
       showToast(data.message || "Need more labeled data to train", true);
     } else if (data.status === "trained") {
-      showToast(`Model retrained successfully on ${data.sample_count} samples!`);
+      showToast(`Model retrained successfully on ${data.sample_count} samples! (θ=${data.metrics?.decision_threshold})`);
       await fetchMetrics();
     } else {
       showToast("Training completed");

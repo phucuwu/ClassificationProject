@@ -119,6 +119,14 @@ def test_sample_crud_and_matrix_export():
         assert stats["negative_count"] == 2
         assert stats["positive_ratio"] == round(1 / 3, 4)
 
+        # 6. Test delete_samples
+        from backend.database import delete_samples
+        deleted_count, _ = delete_samples([id1, id2], db_path=test_db)
+        assert deleted_count == 2
+        remaining = get_samples(db_path=test_db)
+        assert len(remaining) == 1
+        assert remaining[0]["id"] == id3
+
 
 if __name__ == "__main__":
     test_database_initialization_and_wal()

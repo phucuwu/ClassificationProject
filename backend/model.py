@@ -80,21 +80,23 @@ def train_taste_classifier(
     X: np.ndarray,
     y: np.ndarray,
     target_recall: float = 0.90,
-    model_path: Path | str = MODEL_PATH,
+    threshold: float | None = None,
+    model_path: Path | str | None = None,
 ) -> dict[str, Any]:
     """Fit a balanced Logistic Regression classifier on feature matrix X and label vector y.
 
     Args:
         X: Feature matrix of shape (N, 768).
         y: Label vector of shape (N,) with binary integers (0 or 1).
-        target_recall: Desired recall rate used to calibrate decision threshold.
+        target_recall: Desired recall rate used to calibrate decision threshold if threshold is None.
+        threshold: Optional explicit decision threshold. If specified, overrides target_recall calibration.
         model_path: Destination path for saved model pickle file.
 
     Returns:
         Dictionary containing training status, sample distribution, and evaluation metrics.
     """
-    model_path = Path(model_path)
-    model_path.parent.mkdir(parents=True, exist_ok=True)
+    actual_model_path = Path(model_path) if model_path is not None else Path(MODEL_PATH)
+    actual_model_path.parent.mkdir(parents=True, exist_ok=True)
 
     sample_count = len(y)
     unique_classes, counts = np.unique(y, return_counts=True)
@@ -130,20 +132,22 @@ def train_taste_classifier(
     precisions, recalls, thresholds = precision_recall_curve(y, probabilities)
     pr_auc_score = float(auc(recalls, precisions)) if len(recalls) > 1 else 0.0
 
-    # Calibrate decision threshold aiming for target_recall (default 90%)
-    calibrated_threshold = DEFAULT_DECISION_THRESHOLD
-    if len(thresholds) > 0:
-        # Find threshold where recall is closest to target_recall without dropping too low
-        valid_indices = np.where(recalls[:-1] >= target_recall)[0]
-        if len(valid_indices) > 0:
-            calibrated_threshold = float(thresholds[valid_indices[-1]])
-        else:
-            calibrated_threshold = float(thresholds[0])
+    if threshold is not None:
+        calibrated_threshold = float(round(float(np.clip(threshold, 0.05, 0.95)), 2))
+    else:
+        # Calibrate decision threshold aiming for target_recall (default 90%)
+        calibrated_threshold = DEFAULT_DECISION_THRESHOLD
+        if len(thresholds) > 0:
+            # Find threshold where recall is closest to target_recall without dropping too low
+            valid_indices = np.where(recalls[:-1] >= target_recall)[0]
+            if len(valid_indices) > 0:
+                calibrated_threshold = float(thresholds[valid_indices[-1]])
+            else:
+                calibrated_threshold = float(thresholds[0])
+        # Floor threshold to 2 decimal places so true positives at boundary are not excluded
+        calibrated_threshold = float(np.floor(np.clip(calibrated_threshold, 0.05, 0.95) * 100) / 100)
 
-    # Clamp threshold within reasonable bounds and round to 2 decimal places
-    calibrated_threshold = float(round(float(np.clip(calibrated_threshold, 0.10, 0.90)), 2))
-
-    # Evaluate metrics at calibrated threshold
+    # Evaluate metrics at chosen threshold
     binary_preds = (probabilities >= calibrated_threshold).astype(int)
     tp = int(np.sum((binary_preds == 1) & (y == 1)))
     fp = int(np.sum((binary_preds == 1) & (y == 0)))
@@ -177,7 +181,7 @@ def train_taste_classifier(
         "positive_count": positive_count,
         "negative_count": negative_count,
     }
-    with open(model_path, "wb") as f:
+    with open(actual_model_path, "wb") as f:
         pickle.dump(model_payload, f)
 
     return {
@@ -189,13 +193,92 @@ def train_taste_classifier(
     }
 
 
-def load_classifier(model_path: Path | str = MODEL_PATH) -> dict[str, Any] | None:
+def update_decision_threshold(
+    new_threshold: float,
+    model_path: Path | str | None = None,
+    db_path: Path | str | None = None,
+) -> dict[str, Any]:
+    """Update active decision threshold in the trained model and recompute metrics.
+
+    Args:
+        new_threshold: New probability cutoff value between 0.05 and 0.95.
+        model_path: Destination path for saved model pickle file.
+        db_path: Optional SQLite database file path.
+
+    Returns:
+        Dictionary containing success flag, updated threshold, and recomputed metrics.
+    """
+    actual_model_path = Path(model_path) if model_path is not None else Path(MODEL_PATH)
+    model_data = load_classifier(actual_model_path)
+    if model_data is None:
+        return {
+            "success": False,
+            "message": "Model not trained yet. Cannot update decision threshold.",
+        }
+
+    from backend.database import load_training_matrix
+
+    X, y = load_training_matrix(db_path=db_path)
+    if len(y) == 0:
+        return {
+            "success": False,
+            "message": "No labeled samples found in dataset.",
+        }
+
+    classifier: LogisticRegression = model_data["classifier"]
+    probabilities = classifier.predict_proba(X)[:, 1]
+
+    # Calculate Precision-Recall curve and PR-AUC
+    precisions, recalls, _ = precision_recall_curve(y, probabilities)
+    pr_auc_score = float(auc(recalls, precisions)) if len(recalls) > 1 else 0.0
+
+    clamped_threshold = float(round(float(np.clip(new_threshold, 0.05, 0.95)), 2))
+
+    # Evaluate metrics at chosen threshold
+    binary_preds = (probabilities >= clamped_threshold).astype(int)
+    tp = int(np.sum((binary_preds == 1) & (y == 1)))
+    fp = int(np.sum((binary_preds == 1) & (y == 0)))
+    tn = int(np.sum((binary_preds == 0) & (y == 0)))
+    fn = int(np.sum((binary_preds == 0) & (y == 1)))
+
+    rec = float(tp / (tp + fn)) if (tp + fn) > 0 else 0.0
+    prec = float(tp / (tp + fp)) if (tp + fp) > 0 else 0.0
+    f2 = float(fbeta_score(y, binary_preds, beta=2, zero_division=0))
+
+    metrics = {
+        "pr_auc": round(pr_auc_score, 4),
+        "recall": round(rec, 4),
+        "precision": round(prec, 4),
+        "f2_score": round(f2, 4),
+        "decision_threshold": clamped_threshold,
+        "confusion_matrix": {
+            "true_positives": tp,
+            "false_positives": fp,
+            "true_negatives": tn,
+            "false_negatives": fn,
+        },
+    }
+
+    model_data["decision_threshold"] = clamped_threshold
+    model_data["metrics"] = metrics
+
+    with open(actual_model_path, "wb") as f:
+        pickle.dump(model_data, f)
+
+    return {
+        "success": True,
+        "decision_threshold": clamped_threshold,
+        "metrics": metrics,
+    }
+
+
+def load_classifier(model_path: Path | str | None = None) -> dict[str, Any] | None:
     """Load the trained taste classifier from disk if available."""
-    model_path = Path(model_path)
-    if not model_path.exists():
+    actual_model_path = Path(model_path) if model_path is not None else Path(MODEL_PATH)
+    if not actual_model_path.exists():
         return None
     try:
-        with open(model_path, "rb") as f:
+        with open(actual_model_path, "rb") as f:
             return pickle.load(f)
     except Exception:
         return None
@@ -204,7 +287,7 @@ def load_classifier(model_path: Path | str = MODEL_PATH) -> dict[str, Any] | Non
 def predict_taste(
     embedding: np.ndarray,
     threshold: float | None = None,
-    model_path: Path | str = MODEL_PATH,
+    model_path: Path | str | None = None,
 ) -> dict[str, Any]:
     """Calculate prediction score and binary decision for a single vision embedding.
 
@@ -216,7 +299,8 @@ def predict_taste(
     Returns:
         Dictionary containing prediction_score, decision, threshold, and model_loaded status.
     """
-    model_data = load_classifier(model_path)
+    actual_model_path = Path(model_path) if model_path is not None else Path(MODEL_PATH)
+    model_data = load_classifier(actual_model_path)
     if model_data is None:
         return {
             "prediction_score": None,

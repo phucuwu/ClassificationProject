@@ -29,6 +29,7 @@ from backend.database import (
     insert_sample,
     load_training_matrix,
     update_sample_reviews,
+    delete_samples,
 )
 from backend.model import (
     DEFAULT_DECISION_THRESHOLD,
@@ -36,6 +37,7 @@ from backend.model import (
     load_classifier,
     predict_taste,
     train_taste_classifier,
+    update_decision_threshold,
 )
 
 from contextlib import asynccontextmanager
@@ -158,7 +160,12 @@ class CaptureRequest(BaseModel):
 
 
 class TrainRequest(BaseModel):
-    target_recall: float = Field(0.90, description="Target recall rate for decision threshold calibration.")
+    target_recall: float | None = Field(0.90, description="Target recall rate for decision threshold calibration.")
+    threshold: float | None = Field(None, description="Optional explicit threshold override.")
+
+
+class ThresholdRequest(BaseModel):
+    threshold: float = Field(..., ge=0.01, le=0.99, description="Active decision threshold.")
 
 
 class ReviewUpdateItem(BaseModel):
@@ -169,6 +176,10 @@ class ReviewUpdateItem(BaseModel):
 
 class ReviewRequest(BaseModel):
     updates: list[ReviewUpdateItem] = Field(..., description="List of sample review updates.")
+
+
+class BatchDeleteRequest(BaseModel):
+    ids: list[int] = Field(..., description="List of sample database IDs to delete.")
 
 
 # -----------------------------------------------------------------------------
@@ -335,7 +346,12 @@ def train_model(payload: TrainRequest = TrainRequest()) -> dict[str, Any]:
     """Train the balanced Logistic Regression model on all labeled samples in the database."""
     try:
         X, y = load_training_matrix()
-        result = train_taste_classifier(X, y, target_recall=payload.target_recall)
+        result = train_taste_classifier(
+            X,
+            y,
+            target_recall=payload.target_recall if payload.target_recall is not None else 0.90,
+            threshold=payload.threshold,
+        )
 
         if result.get("status") == "trained":
             m = result.get("metrics", {})
@@ -354,6 +370,33 @@ def train_model(payload: TrainRequest = TrainRequest()) -> dict[str, Any]:
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail=f"Model training failed: {str(exc)}",
+        ) from exc
+
+
+@app.post("/api/threshold")
+def set_decision_threshold(payload: ThresholdRequest) -> dict[str, Any]:
+    """Update active decision threshold in the model and recalculate metrics."""
+    try:
+        result = update_decision_threshold(payload.threshold)
+        if not result.get("success"):
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail=result.get("message", "Failed to update threshold."),
+            )
+        add_activity_log(
+            "INFO",
+            "threshold_updated",
+            f"Active decision threshold updated to θ={result.get('decision_threshold'):.2f}",
+            details=result.get("metrics"),
+        )
+        return result
+    except HTTPException:
+        raise
+    except Exception as exc:
+        add_activity_log("ERROR", "threshold_update_failed", f"Failed to update decision threshold: {str(exc)}")
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Failed to update decision threshold: {str(exc)}",
         ) from exc
 
 
@@ -412,6 +455,56 @@ def review_samples(payload: ReviewRequest) -> dict[str, Any]:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail=f"Review update failed: {str(exc)}",
+        ) from exc
+
+
+@app.delete("/api/samples/{sample_id}")
+def delete_single_sample(sample_id: int) -> dict[str, Any]:
+    """Delete a single sample from the database and remove its image file."""
+    try:
+        deleted_count, _ = delete_samples([sample_id])
+        if deleted_count == 0:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail=f"Sample #{sample_id} not found.",
+            )
+        add_activity_log("INFO", "sample_deleted", f"Sample #{sample_id} deleted by user.")
+        return {"status": "success", "deleted_id": sample_id}
+    except HTTPException:
+        raise
+    except Exception as exc:
+        add_activity_log("ERROR", "sample_delete_failed", f"Failed to delete sample #{sample_id}: {str(exc)}")
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Failed to delete sample: {str(exc)}",
+        ) from exc
+
+
+@app.post("/api/samples/batch-delete")
+def batch_delete_samples(payload: BatchDeleteRequest) -> dict[str, Any]:
+    """Delete multiple samples from the database in a single transaction."""
+    try:
+        if not payload.ids:
+            return {"status": "success", "deleted_count": 0, "deleted_ids": []}
+
+        deleted_count, _ = delete_samples(payload.ids)
+        preview_ids = str(payload.ids[:8]) + ("..." if len(payload.ids) > 8 else "")
+        add_activity_log(
+            "INFO",
+            "samples_batch_deleted",
+            f"Batch deleted {deleted_count} sample(s): IDs {preview_ids}",
+            details={"deleted_count": deleted_count, "ids": payload.ids},
+        )
+        return {
+            "status": "success",
+            "deleted_count": deleted_count,
+            "deleted_ids": payload.ids,
+        }
+    except Exception as exc:
+        add_activity_log("ERROR", "samples_batch_delete_failed", f"Failed to batch delete samples: {str(exc)}")
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Failed to batch delete samples: {str(exc)}",
         ) from exc
 
 
