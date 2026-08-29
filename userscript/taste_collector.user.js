@@ -691,9 +691,9 @@
   }
 
   // ---------------------------------------------------------------------------
-  // Super-Like & Paywall Popup Auto-Dismiss
+  // Currency Popup Auto-Dismiss
   // ---------------------------------------------------------------------------
-  function dismissSuperLikeAndPaywallPopups() {
+  function dismissCurrencyPopups() {
     // Only search active modal dialog containers
     const modalContainers = Array.from(
       document.querySelectorAll(
@@ -706,12 +706,10 @@
     for (const modal of modalContainers) {
       const modalText = (modal.innerText || "").toLowerCase();
 
-      // Check for Super-like or Vietnamese Dong currency indicators
-      const hasSuperLike = modalText.includes("super-like") || modalText.includes("super like");
-      const hasVnd = modalText.includes("₫") || modalText.includes("vnd") || /[\d\.,\s]+đ\b/i.test(modalText);
-      const isPaywallOrSuperLike = hasSuperLike || hasVnd;
+      // Check for Vietnamese Dong currency indicators only
+      const hasCurrency = modalText.includes("₫") || modalText.includes("vnd") || /[\d\.,\s]+đ\b/i.test(modalText);
 
-      if (!isPaywallOrSuperLike) continue;
+      if (!hasCurrency) continue;
 
       // Find close or dismiss button strictly inside this modal
       const modalButtons = Array.from(modal.querySelectorAll("button, [role='button']"));
@@ -734,7 +732,7 @@
       if (closeBtn) {
         try {
           closeBtn.click();
-          console.info("Auto-dismissed Super-like/Paywall popup:", modal);
+          console.info("Auto-dismissed currency popup:", modal);
           return;
         } catch (e) { }
       }
@@ -758,7 +756,7 @@
     let debounceTimer = null;
     const observer = new MutationObserver(() => {
       if (debounceTimer) clearTimeout(debounceTimer);
-      debounceTimer = setTimeout(dismissSuperLikeAndPaywallPopups, 300);
+      debounceTimer = setTimeout(dismissCurrencyPopups, 300);
     });
 
     observer.observe(document.body, {
