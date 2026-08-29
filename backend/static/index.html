@@ -1,0 +1,257 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Art Taste Classifier - Developer Dashboard</title>
+  <meta name="description" content="Local developer dashboard to review automated artwork classifications, tune decision thresholds, and monitor model training metrics.">
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Outfit:wght@300;400;500;600;700&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet">
+  <link rel="stylesheet" href="style.css">
+</head>
+<body>
+  <div id="app" class="dashboard-layout">
+    <!-- Header -->
+    <header class="app-header">
+      <div class="header-brand">
+        <div class="brand-icon">🎨</div>
+        <div class="brand-text">
+          <h1>Art Taste Classifier</h1>
+          <span class="brand-subtitle">Developer Dashboard & Review System</span>
+        </div>
+      </div>
+
+      <div class="header-metrics">
+        <div class="metric-pill" id="pill-model-status">
+          <span class="indicator-dot status-idle" id="status-indicator"></span>
+          <span id="model-status-text">Checking Model...</span>
+        </div>
+        <div class="metric-pill">
+          <span class="pill-label">Total Samples:</span>
+          <span class="pill-value" id="stat-total-samples">0</span>
+        </div>
+        <div class="metric-pill">
+          <span class="pill-label">Like Ratio:</span>
+          <span class="pill-value text-accent" id="stat-like-ratio">0.0%</span>
+        </div>
+        <div class="metric-pill">
+          <span class="pill-label">Pending Review:</span>
+          <span class="pill-value text-warning" id="stat-pending-review">0</span>
+        </div>
+      </div>
+    </header>
+
+    <!-- Navigation Tabs -->
+    <nav class="tab-navigation">
+      <button class="nav-tab active" id="tab-btn-review" data-tab="tab-review">
+        <span class="tab-icon">📥</span> Review Queue
+        <span class="tab-counter" id="counter-review">0</span>
+      </button>
+      <button class="nav-tab" id="tab-btn-samples" data-tab="tab-samples">
+        <span class="tab-icon">🖼️</span> All Samples
+        <span class="tab-counter" id="counter-samples">0</span>
+      </button>
+      <button class="nav-tab" id="tab-btn-model" data-tab="tab-model">
+        <span class="tab-icon">⚡</span> Model & Metrics
+      </button>
+      <button class="nav-tab" id="tab-btn-console" data-tab="tab-console">
+        <span class="tab-icon">🖥️</span> Console
+        <span class="tab-counter" id="counter-console">0</span>
+      </button>
+    </nav>
+
+    <!-- Main Content Area -->
+    <main class="main-content">
+
+      <!-- View 1: Review Queue -->
+      <section id="tab-review" class="tab-panel active">
+        <div class="panel-toolbar">
+          <div class="toolbar-left">
+            <h2>Review Queue (Full Auto Decisions)</h2>
+            <p class="toolbar-help">Press <code>1</code> for Like, <code>0</code> for Dislike on selected artwork, or click badges directly.</p>
+          </div>
+          <div class="toolbar-right">
+            <div class="filter-group">
+              <label for="filter-review-pred">Prediction:</label>
+              <select id="filter-review-pred" class="select-input">
+                <option value="all">All Predictions</option>
+                <option value="1">Predicted Likes (1)</option>
+                <option value="0">Predicted Dislikes (0)</option>
+              </select>
+            </div>
+            <button id="btn-confirm-all" class="btn btn-primary">
+              ✓ Mark All Visible as Reviewed
+            </button>
+          </div>
+        </div>
+
+        <div id="review-grid" class="cards-grid">
+          <!-- Dynamically populated sample cards -->
+        </div>
+
+        <div id="review-empty-state" class="empty-state hidden">
+          <div class="empty-icon">✨</div>
+          <h3>Review Queue is Empty</h3>
+          <p>All automated decisions have been reviewed. Run Full Auto Mode in the userscript to process more artworks.</p>
+        </div>
+      </section>
+
+      <!-- View 2: All Samples -->
+      <section id="tab-samples" class="tab-panel">
+        <div class="panel-toolbar">
+          <div class="toolbar-left">
+            <h2>Dataset Inspector</h2>
+            <p class="toolbar-help">Browse all ingested samples across manual, supervised, and automated modes.</p>
+          </div>
+          <div class="toolbar-right">
+            <div class="filter-group">
+              <label for="filter-sample-mode">Mode:</label>
+              <select id="filter-sample-mode" class="select-input">
+                <option value="">All Modes</option>
+                <option value="manual">Manual</option>
+                <option value="supervised">Supervised</option>
+                <option value="auto">Auto</option>
+              </select>
+            </div>
+            <div class="filter-group">
+              <label for="filter-sample-label">Label:</label>
+              <select id="filter-sample-label" class="select-input">
+                <option value="">All Labels</option>
+                <option value="1">Likes (1)</option>
+                <option value="0">Dislikes (0)</option>
+              </select>
+            </div>
+            <button id="btn-refresh-samples" class="btn btn-secondary">↻ Refresh</button>
+          </div>
+        </div>
+
+        <div id="samples-grid" class="cards-grid">
+          <!-- Dynamically populated dataset cards -->
+        </div>
+      </section>
+
+      <!-- View 3: Model & Metrics -->
+      <section id="tab-model" class="tab-panel">
+        <div class="model-grid-layout">
+          <!-- Left Column: Metrics Overview -->
+          <div class="metric-card">
+            <h3>Taste Classifier Status</h3>
+            <div class="model-metrics-summary" id="model-metrics-display">
+              <!-- Dynamically populated metrics -->
+            </div>
+
+            <hr class="card-divider">
+
+            <div class="retrain-section">
+              <h4>Retrain Taste Classifier</h4>
+              <p class="subtext">Fits balanced Logistic Regression on all labeled samples in the dataset.</p>
+              <div class="form-row">
+                <label for="input-target-recall">Target Recall (Sensitivity):</label>
+                <input type="number" id="input-target-recall" class="number-input" min="0.5" max="0.99" step="0.05" value="0.90">
+              </div>
+              <button id="btn-retrain" class="btn btn-primary btn-large">
+                🚀 Retrain Model
+              </button>
+            </div>
+          </div>
+
+          <!-- Right Column: Threshold & Matrix -->
+          <div class="metric-card">
+            <h3>Decision Threshold & Confusion Matrix</h3>
+            <p class="subtext">Threshold determines the probability cutoff for predicting positive class (Like).</p>
+
+            <div class="threshold-slider-container">
+              <div class="slider-header">
+                <label for="slider-threshold">Active Threshold (θ):</label>
+                <span class="threshold-value" id="display-threshold-val">0.35</span>
+              </div>
+              <input type="range" id="slider-threshold" class="slider-input" min="0.10" max="0.90" step="0.01" value="0.35">
+            </div>
+
+            <div class="confusion-matrix-container">
+              <h4>Confusion Matrix</h4>
+              <table class="confusion-table" id="table-confusion-matrix">
+                <thead>
+                  <tr>
+                    <th></th>
+                    <th>Actual Like (1)</th>
+                    <th>Actual Dislike (0)</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  <tr>
+                    <td class="row-header">Predicted Like</td>
+                    <td class="cell-tp" id="cell-tp">0</td>
+                    <td class="cell-fp" id="cell-fp">0</td>
+                  </tr>
+                  <tr>
+                    <td class="row-header">Predicted Dislike</td>
+                    <td class="cell-fn" id="cell-fn">0</td>
+                    <td class="cell-tn" id="cell-tn">0</td>
+                  </tr>
+                </tbody>
+              </table>
+            </div>
+          </div>
+        </div>
+      </section>
+
+      <!-- View 4: Live Console / Activity Log -->
+      <section id="tab-console" class="tab-panel">
+        <div class="panel-toolbar">
+          <div class="toolbar-left">
+            <h2>System Activity & Interaction Console</h2>
+            <p class="toolbar-help">Real-time log of manual ratings, automated decisions, inference requests, and model updates.</p>
+          </div>
+          <div class="toolbar-right">
+            <div class="filter-group">
+              <label for="filter-log-level">Level:</label>
+              <select id="filter-log-level" class="select-input">
+                <option value="">All Levels</option>
+                <option value="SUCCESS">Success</option>
+                <option value="INFO">Info</option>
+                <option value="WARNING">Warning</option>
+                <option value="ERROR">Error</option>
+              </select>
+            </div>
+            <div class="filter-group">
+              <label for="filter-log-mode">Mode:</label>
+              <select id="filter-log-mode" class="select-input">
+                <option value="">All Modes</option>
+                <option value="manual">Manual</option>
+                <option value="supervised">Supervised</option>
+                <option value="auto">Auto</option>
+              </select>
+            </div>
+            <button id="btn-clear-logs" class="btn btn-secondary">🗑️ Clear Console</button>
+            <button id="btn-refresh-logs" class="btn btn-secondary">↻ Refresh</button>
+          </div>
+        </div>
+
+        <div class="console-terminal-wrapper">
+          <div class="console-terminal-header">
+            <div class="terminal-dots">
+              <span class="dot red"></span>
+              <span class="dot yellow"></span>
+              <span class="dot green"></span>
+            </div>
+            <span class="terminal-title">activity-stream.log</span>
+            <div class="terminal-status">
+              <span class="live-pulse"></span> LIVE
+            </div>
+          </div>
+          <div id="console-logs-container" class="console-logs-body">
+            <!-- Dynamically populated log rows -->
+          </div>
+        </div>
+      </section>
+    </main>
+
+    <!-- Toast Notification Container -->
+    <div id="toast-container" class="toast-container"></div>
+  </div>
+
+  <script src="app.js"></script>
+</body>
+</html>
