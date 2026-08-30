@@ -52,6 +52,10 @@
         <span class="tab-icon">🖼️</span> Samples
         <span class="tab-counter" id="counter-samples">0</span>
       </button>
+      <button class="nav-tab" id="tab-btn-visualize" data-tab="tab-visualize">
+        <span class="tab-icon">🌌</span> Embedding Space
+        <span class="tab-counter" id="counter-visualize">0</span>
+      </button>
       <button class="nav-tab" id="tab-btn-model" data-tab="tab-model">
         <span class="tab-icon">⚡</span> Model & Metrics
       </button>
@@ -133,6 +137,132 @@
 
         <div id="samples-grid" class="cards-grid">
           <!-- Dynamically populated dataset cards -->
+        </div>
+      </section>
+
+      <!-- View: Embedding Space Visualization -->
+      <section id="tab-visualize" class="tab-panel">
+        <div class="panel-toolbar">
+          <div class="toolbar-left">
+            <h2>Vision Embedding Space (2D Projection)</h2>
+            <p class="toolbar-help">Explore the 768-dimensional vision embedding space. Pan by dragging, zoom with scroll wheel, or hover over points for artwork preview.</p>
+          </div>
+          <div class="toolbar-right">
+            <div class="filter-group">
+              <label for="scatter-select-method">Algorithm:</label>
+              <select id="scatter-select-method" class="select-input">
+                <option value="pca">PCA (2D)</option>
+                <option value="tsne">t-SNE (2D)</option>
+              </select>
+            </div>
+            <div class="filter-group">
+              <label for="scatter-select-color">Color By:</label>
+              <select id="scatter-select-color" class="select-input">
+                <option value="label">Label (Like / Dislike)</option>
+                <option value="score">Prediction Score</option>
+              </select>
+            </div>
+            <div class="scatter-toggles">
+              <label class="toggle-pill pill-like">
+                <input type="checkbox" id="toggle-show-likes" checked>
+                <span class="dot-indicator dot-like"></span> Likes (<span id="scatter-likes-count">0</span>)
+              </label>
+              <label class="toggle-pill pill-dislike">
+                <input type="checkbox" id="toggle-show-dislikes" checked>
+                <span class="dot-indicator dot-dislike"></span> Dislikes (<span id="scatter-dislikes-count">0</span>)
+              </label>
+              <label class="toggle-pill pill-unlabeled">
+                <input type="checkbox" id="toggle-show-unlabeled" checked>
+                <span class="dot-indicator dot-unlabeled"></span> Unlabeled (<span id="scatter-unlabeled-count">0</span>)
+              </label>
+            </div>
+            <button id="btn-reset-scatter-zoom" class="btn btn-secondary">🔍 Reset View</button>
+            <button id="btn-refresh-scatter" class="btn btn-secondary">↻ Refresh</button>
+          </div>
+        </div>
+
+        <div class="scatter-container-wrapper">
+          <div class="scatter-canvas-card">
+            <div class="scatter-hud">
+              <div class="hud-item" id="scatter-hud-points">Points: 0</div>
+              <div class="hud-item" id="scatter-hud-variance">Variance: --</div>
+              <div class="hud-item hud-hint">Drag to Pan | Scroll to Zoom</div>
+            </div>
+            <canvas id="scatter-canvas"></canvas>
+            
+            <div id="scatter-empty-state" class="empty-state hidden">
+              <div class="empty-icon">🌌</div>
+              <h3>No Embedding Data Available</h3>
+              <p>Record samples in the userscript to view artworks projected in embedding space.</p>
+            </div>
+
+            <!-- Floating Hover Tooltip -->
+            <div id="scatter-tooltip" class="scatter-tooltip hidden">
+              <div class="tooltip-img-wrapper">
+                <img id="scatter-tooltip-img" src="" alt="Artwork thumbnail">
+              </div>
+              <div class="tooltip-content">
+                <div class="tooltip-header">
+                  <span class="tooltip-id" id="scatter-tooltip-id">Sample #1</span>
+                  <span class="badge" id="scatter-tooltip-label">Like</span>
+                </div>
+                <div class="tooltip-meta">
+                  <div class="tooltip-row">
+                    <span class="label">Score:</span>
+                    <span class="val" id="scatter-tooltip-score">0.85</span>
+                  </div>
+                  <div class="tooltip-row">
+                    <span class="label">Mode:</span>
+                    <span class="val" id="scatter-tooltip-mode">manual</span>
+                  </div>
+                </div>
+              </div>
+            </div>
+          </div>
+
+          <!-- Side Inspector Drawer -->
+          <div id="scatter-inspector" class="scatter-inspector hidden">
+            <div class="inspector-header">
+              <h3>Selected Sample</h3>
+              <button id="btn-close-scatter-inspector" class="btn-icon">✕</button>
+            </div>
+            <div class="inspector-body">
+              <div class="inspector-img-box">
+                <img id="scatter-inspector-img" src="" alt="Selected sample">
+              </div>
+              <div class="inspector-details">
+                <div class="detail-row">
+                  <span class="d-label">ID:</span>
+                  <span class="d-val" id="scatter-insp-id">#0</span>
+                </div>
+                <div class="detail-row">
+                  <span class="d-label">Label:</span>
+                  <span class="d-val" id="scatter-insp-label">--</span>
+                </div>
+                <div class="detail-row">
+                  <span class="d-label">Prediction Score:</span>
+                  <span class="d-val" id="scatter-insp-score">--</span>
+                </div>
+                <div class="detail-row">
+                  <span class="d-label">Operating Mode:</span>
+                  <span class="d-val" id="scatter-insp-mode">--</span>
+                </div>
+                <div class="detail-row">
+                  <span class="d-label">Review Status:</span>
+                  <span class="d-val" id="scatter-insp-reviewed">--</span>
+                </div>
+                <div class="detail-row">
+                  <span class="d-label">Hash:</span>
+                  <span class="d-val monospace" id="scatter-insp-hash">--</span>
+                </div>
+              </div>
+              <div class="inspector-actions">
+                <button id="btn-scatter-set-like" class="btn btn-like-action">✓ Set Like (1)</button>
+                <button id="btn-scatter-set-dislike" class="btn btn-dislike-action">✕ Set Dislike (0)</button>
+                <button id="btn-scatter-delete" class="btn btn-danger-action">🗑️ Delete Sample</button>
+              </div>
+            </div>
+          </div>
         </div>
       </section>
 

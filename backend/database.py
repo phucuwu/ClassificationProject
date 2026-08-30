@@ -346,3 +346,52 @@ def get_dataset_statistics(
         }
     finally:
         conn.close()
+
+
+def load_embedding_scatter_data(
+    db_path: Path | str | None = None,
+) -> tuple[list[dict[str, Any]], np.ndarray]:
+    """Retrieve all samples with metadata and the (N, 768) vision embedding matrix.
+
+    Returns:
+        samples_metadata: List of dicts with id, image_hash, file_path, label,
+                          prediction_score, mode, reviewed, and created_at.
+        X: 2D NumPy array of shape (N, 768) with float32 embeddings.
+    """
+    conn = get_db_connection(db_path)
+    try:
+        cursor = conn.execute(
+            """
+            SELECT id, image_hash, file_path, label, prediction_score, mode, reviewed, created_at, embedding
+            FROM samples
+            WHERE embedding IS NOT NULL
+            ORDER BY id ASC;
+            """
+        )
+        rows = cursor.fetchall()
+        if not rows:
+            return [], np.empty((0, 768), dtype=np.float32)
+
+        metadata_list: list[dict[str, Any]] = []
+        embeddings_list: list[np.ndarray] = []
+
+        for row in rows:
+            metadata_list.append(
+                {
+                    "id": row["id"],
+                    "image_hash": row["image_hash"],
+                    "file_path": row["file_path"],
+                    "label": row["label"],
+                    "prediction_score": row["prediction_score"],
+                    "mode": row["mode"],
+                    "reviewed": row["reviewed"],
+                    "created_at": row["created_at"],
+                }
+            )
+            embeddings_list.append(np.frombuffer(row["embedding"], dtype=np.float32))
+
+        X = np.vstack(embeddings_list).astype(np.float32)
+        return metadata_list, X
+    finally:
+        conn.close()
+

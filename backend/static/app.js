@@ -41,6 +41,12 @@ function initTabs() {
         fetchReviewQueue();
       } else if (activeTab === "tab-samples") {
         fetchDatasetSamples();
+      } else if (activeTab === "tab-visualize") {
+        fetchScatterData();
+        requestAnimationFrame(() => {
+          resizeScatterCanvas();
+          drawScatterPlot();
+        });
       } else if (activeTab === "tab-model") {
         fetchMetrics();
       } else if (activeTab === "tab-console") {
@@ -135,6 +141,36 @@ function initEventListeners() {
   if (logModeFilter) logModeFilter.addEventListener("change", fetchConsoleLogs);
   if (clearLogsBtn) clearLogsBtn.addEventListener("click", handleClearLogs);
   if (refreshLogsBtn) refreshLogsBtn.addEventListener("click", fetchConsoleLogs);
+
+  // Scatter Plot Visualizer Controls
+  const scatterMethodSelect = document.getElementById("scatter-select-method");
+  const scatterColorSelect = document.getElementById("scatter-select-color");
+  const toggleLikes = document.getElementById("toggle-show-likes");
+  const toggleDislikes = document.getElementById("toggle-show-dislikes");
+  const toggleUnlabeled = document.getElementById("toggle-show-unlabeled");
+  const resetScatterZoomBtn = document.getElementById("btn-reset-scatter-zoom");
+  const refreshScatterBtn = document.getElementById("btn-refresh-scatter");
+  const closeInspectorBtn = document.getElementById("btn-close-scatter-inspector");
+
+  if (scatterMethodSelect) scatterMethodSelect.addEventListener("change", () => fetchScatterData());
+  if (scatterColorSelect) scatterColorSelect.addEventListener("change", () => drawScatterPlot());
+  if (toggleLikes) toggleLikes.addEventListener("change", () => drawScatterPlot());
+  if (toggleDislikes) toggleDislikes.addEventListener("change", () => drawScatterPlot());
+  if (toggleUnlabeled) toggleUnlabeled.addEventListener("change", () => drawScatterPlot());
+  if (resetScatterZoomBtn) resetScatterZoomBtn.addEventListener("click", () => resetScatterView());
+  if (refreshScatterBtn) refreshScatterBtn.addEventListener("click", () => fetchScatterData());
+  if (closeInspectorBtn) closeInspectorBtn.addEventListener("click", () => closeScatterInspector());
+
+  // Inspector Quick Actions
+  const btnSetLike = document.getElementById("btn-scatter-set-like");
+  const btnSetDislike = document.getElementById("btn-scatter-set-dislike");
+  const btnDeleteSample = document.getElementById("btn-scatter-delete");
+
+  if (btnSetLike) btnSetLike.addEventListener("click", () => handleInspectorSetLabel(1));
+  if (btnSetDislike) btnSetDislike.addEventListener("click", () => handleInspectorSetLabel(0));
+  if (btnDeleteSample) btnDeleteSample.addEventListener("click", () => handleInspectorDeleteSample());
+
+  initScatterCanvas();
 
   // Keyboard Navigation: '1' for Like, '0' for Dislike, Arrow keys to navigate
   window.addEventListener("keydown", handleGlobalKeydown);
@@ -753,3 +789,565 @@ function showToast(message, isError = false) {
     toast.remove();
   }, 3000);
 }
+
+// ----------------------------------------------------------------------------
+// Embedding Space Interactive Scatter Plot
+// ----------------------------------------------------------------------------
+
+let scatterPoints = [];
+let scatterMetadata = { total_points: 0, method: "pca", variance_ratio: null };
+let scatterTransform = {
+  zoom: 1.0,
+  panX: 0,
+  panY: 0,
+  isPanning: false,
+  startX: 0,
+  startY: 0,
+};
+let hoveredScatterPoint = null;
+let selectedScatterPoint = null;
+
+function initScatterCanvas() {
+  const canvas = document.getElementById("scatter-canvas");
+  if (!canvas) return;
+
+  const card = canvas.parentElement;
+  if (card && window.ResizeObserver) {
+    const ro = new ResizeObserver(() => {
+      if (activeTab === "tab-visualize") {
+        resizeScatterCanvas();
+        drawScatterPlot();
+      }
+    });
+    ro.observe(card);
+  }
+
+  window.addEventListener("resize", () => {
+    if (activeTab === "tab-visualize") {
+      resizeScatterCanvas();
+      drawScatterPlot();
+    }
+  });
+
+  canvas.addEventListener("pointerdown", (e) => {
+    if (e.button !== 0) return;
+    scatterTransform.isPanning = true;
+    scatterTransform.startX = e.clientX - scatterTransform.panX;
+    scatterTransform.startY = e.clientY - scatterTransform.panY;
+    try {
+      canvas.setPointerCapture(e.pointerId);
+    } catch (_) {}
+  });
+
+  canvas.addEventListener("pointermove", (e) => {
+    if (scatterTransform.isPanning) {
+      scatterTransform.panX = e.clientX - scatterTransform.startX;
+      scatterTransform.panY = e.clientY - scatterTransform.startY;
+      drawScatterPlot();
+    } else {
+      handleScatterMouseMove(e);
+    }
+  });
+
+  canvas.addEventListener("pointerup", (e) => {
+    if (scatterTransform.isPanning) {
+      scatterTransform.isPanning = false;
+      try {
+        canvas.releasePointerCapture(e.pointerId);
+      } catch (_) {}
+    }
+  });
+
+  canvas.addEventListener("pointercancel", () => {
+    scatterTransform.isPanning = false;
+  });
+
+  canvas.addEventListener("pointerleave", () => {
+    hideScatterTooltip();
+    hoveredScatterPoint = null;
+    drawScatterPlot();
+  });
+
+  canvas.addEventListener("wheel", (e) => {
+    e.preventDefault();
+    const rect = canvas.getBoundingClientRect();
+    const mouseX = e.clientX - rect.left;
+    const mouseY = e.clientY - rect.top;
+
+    const zoomFactor = e.deltaY < 0 ? 1.15 : 0.87;
+    const newZoom = Math.max(0.2, Math.min(30, scatterTransform.zoom * zoomFactor));
+
+    scatterTransform.panX = mouseX - (mouseX - scatterTransform.panX) * (newZoom / scatterTransform.zoom);
+    scatterTransform.panY = mouseY - (mouseY - scatterTransform.panY) * (newZoom / scatterTransform.zoom);
+    scatterTransform.zoom = newZoom;
+
+    drawScatterPlot();
+    handleScatterMouseMove(e);
+  }, { passive: false });
+
+  canvas.addEventListener("click", (e) => {
+    if (hoveredScatterPoint) {
+      selectedScatterPoint = hoveredScatterPoint;
+      openScatterInspector(selectedScatterPoint);
+      drawScatterPlot();
+    }
+  });
+}
+
+async function fetchScatterData() {
+  const methodSelect = document.getElementById("scatter-select-method");
+  const method = methodSelect ? methodSelect.value : "pca";
+
+  try {
+    const res = await fetch(`/api/embeddings/scatter?method=${method}`);
+    if (!res.ok) throw new Error("Failed to fetch scatter data");
+    const data = await res.json();
+
+    scatterPoints = data.points || [];
+    scatterMetadata = data;
+
+    // Update UI counters and HUD
+    const counterEl = document.getElementById("counter-visualize");
+    if (counterEl) counterEl.textContent = scatterPoints.length;
+
+    const hudPoints = document.getElementById("scatter-hud-points");
+    if (hudPoints) hudPoints.textContent = `Points: ${scatterPoints.length}`;
+
+    const hudVariance = document.getElementById("scatter-hud-variance");
+    if (hudVariance) {
+      if (data.variance_ratio && data.variance_ratio.length >= 2) {
+        const v1 = (data.variance_ratio[0] * 100).toFixed(1);
+        const v2 = (data.variance_ratio[1] * 100).toFixed(1);
+        hudVariance.textContent = `PC1: ${v1}%, PC2: ${v2}%`;
+      } else {
+        hudVariance.textContent = `Method: ${method.toUpperCase()}`;
+      }
+    }
+
+    // Update filter counts
+    let likes = 0, dislikes = 0, unlabeled = 0;
+    scatterPoints.forEach((pt) => {
+      if (pt.label === 1) likes++;
+      else if (pt.label === 0) dislikes++;
+      else unlabeled++;
+    });
+
+    const lCount = document.getElementById("scatter-likes-count");
+    const dCount = document.getElementById("scatter-dislikes-count");
+    const uCount = document.getElementById("scatter-unlabeled-count");
+    if (lCount) lCount.textContent = likes;
+    if (dCount) dCount.textContent = dislikes;
+    if (uCount) uCount.textContent = unlabeled;
+
+    const emptyState = document.getElementById("scatter-empty-state");
+    if (emptyState) {
+      emptyState.classList.toggle("hidden", scatterPoints.length > 0);
+    }
+
+    requestAnimationFrame(() => {
+      resizeScatterCanvas();
+      resetScatterView();
+    });
+  } catch (err) {
+    console.error("Error fetching scatter data:", err);
+    showToast("Failed to load embedding scatter plot", true);
+  }
+}
+
+function resizeScatterCanvas() {
+  const canvas = document.getElementById("scatter-canvas");
+  if (!canvas) return;
+  const rect = canvas.getBoundingClientRect();
+  if (rect.width === 0 || rect.height === 0) return;
+
+  const dpr = window.devicePixelRatio || 1;
+  canvas.width = Math.floor(rect.width * dpr);
+  canvas.height = Math.floor(rect.height * dpr);
+}
+
+function getScatterDataBounds() {
+  if (scatterPoints.length === 0) {
+    return { minX: -1, maxX: 1, minY: -1, maxY: 1, spanX: 2, spanY: 2, midX: 0, midY: 0 };
+  }
+
+  let minX = Infinity, maxX = -Infinity, minY = Infinity, maxY = -Infinity;
+  scatterPoints.forEach((p) => {
+    if (p.x < minX) minX = p.x;
+    if (p.x > maxX) maxX = p.x;
+    if (p.y < minY) minY = p.y;
+    if (p.y > maxY) maxY = p.y;
+  });
+
+  if (minX === maxX) { minX -= 1; maxX += 1; }
+  if (minY === maxY) { minY -= 1; maxY += 1; }
+
+  const spanX = maxX - minX || 1;
+  const spanY = maxY - minY || 1;
+  const midX = (minX + maxX) / 2;
+  const midY = (minY + maxY) / 2;
+
+  return { minX, maxX, minY, maxY, spanX, spanY, midX, midY };
+}
+
+function resetScatterView() {
+  scatterTransform.zoom = 1.0;
+  scatterTransform.panX = 0;
+  scatterTransform.panY = 0;
+  drawScatterPlot();
+}
+
+function worldToScreen(wx, wy, bounds, rect) {
+  const padding = 60;
+  const availW = Math.max(100, rect.width - padding * 2);
+  const availH = Math.max(100, rect.height - padding * 2);
+
+  const baseScale = Math.min(availW / bounds.spanX, availH / bounds.spanY);
+  const scale = baseScale * scatterTransform.zoom;
+
+  const cx = rect.width / 2 + scatterTransform.panX;
+  const cy = rect.height / 2 + scatterTransform.panY;
+
+  const sx = cx + (wx - bounds.midX) * scale;
+  const sy = cy - (wy - bounds.midY) * scale; // Invert Y for Cartesian coordinates
+  return { x: sx, y: sy };
+}
+
+function getPointColor(point, colorMode) {
+  if (colorMode === "score") {
+    const score = point.prediction_score;
+    if (score === null || score === undefined) return "#94a3b8"; // slate
+    // Interpolate: score 0 (blue #3b82f6) -> score 0.5 (purple #a855f7) -> score 1.0 (emerald #10b981)
+    if (score < 0.5) {
+      const t = score / 0.5;
+      return interpolateColor("#3b82f6", "#a855f7", t);
+    } else {
+      const t = (score - 0.5) / 0.5;
+      return interpolateColor("#a855f7", "#10b981", t);
+    }
+  }
+
+  // Color by ground truth label
+  if (point.label === 1) return "#10b981"; // Like (Emerald)
+  if (point.label === 0) return "#ef4444"; // Dislike (Rose)
+  return "#f59e0b"; // Unlabeled (Amber)
+}
+
+function interpolateColor(color1, color2, factor) {
+  const c1 = hexToRgb(color1);
+  const c2 = hexToRgb(color2);
+  if (!c1 || !c2) return color1;
+  const r = Math.round(c1.r + factor * (c2.r - c1.r));
+  const g = Math.round(c1.g + factor * (c2.g - c1.g));
+  const b = Math.round(c1.b + factor * (c2.b - c1.b));
+  return `rgb(${r}, ${g}, ${b})`;
+}
+
+function hexToRgb(hex) {
+  const result = /^#?([a-f\d]{2})([a-f\d]{2})([a-f\d]{2})$/i.exec(hex);
+  return result ? {
+    r: parseInt(result[1], 16),
+    g: parseInt(result[2], 16),
+    b: parseInt(result[3], 16),
+  } : null;
+}
+
+function drawScatterPlot() {
+  const canvas = document.getElementById("scatter-canvas");
+  if (!canvas) return;
+
+  const rect = canvas.getBoundingClientRect();
+  if (rect.width === 0 || rect.height === 0) return;
+
+  const dpr = window.devicePixelRatio || 1;
+  const targetW = Math.floor(rect.width * dpr);
+  const targetH = Math.floor(rect.height * dpr);
+
+  if (canvas.width !== targetW || canvas.height !== targetH) {
+    canvas.width = targetW;
+    canvas.height = targetH;
+  }
+
+  const ctx = canvas.getContext("2d");
+  ctx.save();
+  ctx.scale(dpr, dpr);
+  ctx.clearRect(0, 0, rect.width, rect.height);
+
+  if (scatterPoints.length === 0) {
+    ctx.restore();
+    return;
+  }
+
+  const bounds = getScatterDataBounds();
+  const colorMode = document.getElementById("scatter-select-color")?.value || "label";
+  const showLikes = document.getElementById("toggle-show-likes")?.checked ?? true;
+  const showDislikes = document.getElementById("toggle-show-dislikes")?.checked ?? true;
+  const showUnlabeled = document.getElementById("toggle-show-unlabeled")?.checked ?? true;
+
+  // Draw background grid lines & axes
+  drawGridAndAxes(ctx, bounds, rect);
+
+  // Render scatter points
+  scatterPoints.forEach((point) => {
+    if (point.label === 1 && !showLikes) return;
+    if (point.label === 0 && !showDislikes) return;
+    if (point.label === null && !showUnlabeled) return;
+
+    const screenPos = worldToScreen(point.x, point.y, bounds, rect);
+    const color = getPointColor(point, colorMode);
+    const isHovered = hoveredScatterPoint && hoveredScatterPoint.id === point.id;
+    const isSelected = selectedScatterPoint && selectedScatterPoint.id === point.id;
+
+    const radius = isHovered ? 8 : (isSelected ? 7 : 5);
+
+    // Glow halo
+    if (isHovered || isSelected) {
+      ctx.beginPath();
+      ctx.arc(screenPos.x, screenPos.y, radius + 5, 0, Math.PI * 2);
+      ctx.fillStyle = isHovered ? "rgba(99, 102, 241, 0.35)" : "rgba(255, 255, 255, 0.25)";
+      ctx.fill();
+    }
+
+    // Main Point
+    ctx.beginPath();
+    ctx.arc(screenPos.x, screenPos.y, radius, 0, Math.PI * 2);
+    ctx.fillStyle = color;
+    ctx.fill();
+    ctx.lineWidth = isHovered ? 2.5 : 1.5;
+    ctx.strokeStyle = isHovered ? "#ffffff" : "rgba(255, 255, 255, 0.4)";
+    ctx.stroke();
+  });
+
+  ctx.restore();
+}
+
+function drawGridAndAxes(ctx, bounds, rect) {
+  const origin = worldToScreen(0, 0, bounds, rect);
+
+  // Grid lines
+  ctx.strokeStyle = "rgba(255, 255, 255, 0.04)";
+  ctx.lineWidth = 1;
+
+  const step = 50;
+  for (let x = (origin.x % step); x < rect.width; x += step) {
+    ctx.beginPath();
+    ctx.moveTo(x, 0);
+    ctx.lineTo(x, rect.height);
+    ctx.stroke();
+  }
+  for (let y = (origin.y % step); y < rect.height; y += step) {
+    ctx.beginPath();
+    ctx.moveTo(0, y);
+    ctx.lineTo(rect.width, y);
+    ctx.stroke();
+  }
+
+  // Axes crossing origin
+  ctx.strokeStyle = "rgba(255, 255, 255, 0.12)";
+  ctx.lineWidth = 1.5;
+
+  if (origin.x >= 0 && origin.x <= rect.width) {
+    ctx.beginPath();
+    ctx.moveTo(origin.x, 0);
+    ctx.lineTo(origin.x, rect.height);
+    ctx.stroke();
+  }
+
+  if (origin.y >= 0 && origin.y <= rect.height) {
+    ctx.beginPath();
+    ctx.moveTo(0, origin.y);
+    ctx.lineTo(rect.width, origin.y);
+    ctx.stroke();
+  }
+}
+
+function handleScatterMouseMove(e) {
+  const canvas = document.getElementById("scatter-canvas");
+  if (!canvas || scatterPoints.length === 0) return;
+
+  const rect = canvas.getBoundingClientRect();
+  const mouseX = e.clientX - rect.left;
+  const mouseY = e.clientY - rect.top;
+
+  const bounds = getScatterDataBounds();
+  const showLikes = document.getElementById("toggle-show-likes")?.checked ?? true;
+  const showDislikes = document.getElementById("toggle-show-dislikes")?.checked ?? true;
+  const showUnlabeled = document.getElementById("toggle-show-unlabeled")?.checked ?? true;
+
+  let closest = null;
+  let minDistance = 14; // Hit distance threshold in px
+
+  for (let i = 0; i < scatterPoints.length; i++) {
+    const pt = scatterPoints[i];
+    if (pt.label === 1 && !showLikes) continue;
+    if (pt.label === 0 && !showDislikes) continue;
+    if (pt.label === null && !showUnlabeled) continue;
+
+    const screenPos = worldToScreen(pt.x, pt.y, bounds, rect);
+    const dist = Math.hypot(screenPos.x - mouseX, screenPos.y - mouseY);
+
+    if (dist < minDistance) {
+      minDistance = dist;
+      closest = pt;
+    }
+  }
+
+  if (closest !== hoveredScatterPoint) {
+    hoveredScatterPoint = closest;
+    drawScatterPlot();
+  }
+
+  if (hoveredScatterPoint) {
+    showScatterTooltip(hoveredScatterPoint, mouseX, mouseY, rect);
+  } else {
+    hideScatterTooltip();
+  }
+}
+
+function showScatterTooltip(point, mouseX, mouseY, rect) {
+  const tooltip = document.getElementById("scatter-tooltip");
+  if (!tooltip) return;
+
+  const imgEl = document.getElementById("scatter-tooltip-img");
+  const idEl = document.getElementById("scatter-tooltip-id");
+  const labelEl = document.getElementById("scatter-tooltip-label");
+  const scoreEl = document.getElementById("scatter-tooltip-score");
+  const modeEl = document.getElementById("scatter-tooltip-mode");
+
+  if (idEl) idEl.textContent = `Sample #${point.id}`;
+  if (imgEl) imgEl.src = point.image_url;
+
+  if (labelEl) {
+    if (point.label === 1) {
+      labelEl.textContent = "Like (1)";
+      labelEl.className = "badge badge-like";
+    } else if (point.label === 0) {
+      labelEl.textContent = "Dislike (0)";
+      labelEl.className = "badge badge-dislike";
+    } else {
+      labelEl.textContent = "Unlabeled";
+      labelEl.className = "badge badge-unlabeled";
+    }
+  }
+
+  if (scoreEl) {
+    scoreEl.textContent = point.prediction_score !== null ? point.prediction_score.toFixed(2) : "N/A";
+  }
+  if (modeEl) {
+    modeEl.textContent = point.mode || "manual";
+  }
+
+  tooltip.classList.remove("hidden");
+
+  // Keep tooltip on screen
+  const tooltipWidth = 230;
+  const tooltipHeight = 200;
+  let posX = mouseX + 16;
+  let posY = mouseY + 16;
+
+  if (posX + tooltipWidth > rect.width) {
+    posX = mouseX - tooltipWidth - 12;
+  }
+  if (posY + tooltipHeight > rect.height) {
+    posY = mouseY - tooltipHeight - 12;
+  }
+
+  tooltip.style.left = `${posX}px`;
+  tooltip.style.top = `${posY}px`;
+}
+
+function hideScatterTooltip() {
+  const tooltip = document.getElementById("scatter-tooltip");
+  if (tooltip) tooltip.classList.add("hidden");
+}
+
+function openScatterInspector(point) {
+  const inspector = document.getElementById("scatter-inspector");
+  if (!inspector) return;
+
+  document.getElementById("scatter-insp-id").textContent = `#${point.id}`;
+  document.getElementById("scatter-insp-hash").textContent = `${point.image_hash.slice(0, 16)}...`;
+  document.getElementById("scatter-insp-mode").textContent = point.mode;
+  document.getElementById("scatter-insp-reviewed").textContent = point.reviewed === 1 ? "Confirmed" : "Pending";
+  document.getElementById("scatter-insp-score").textContent = point.prediction_score !== null ? point.prediction_score.toFixed(4) : "N/A";
+
+  const labelEl = document.getElementById("scatter-insp-label");
+  if (point.label === 1) {
+    labelEl.textContent = "Like (1)";
+    labelEl.style.color = "var(--color-like)";
+  } else if (point.label === 0) {
+    labelEl.textContent = "Dislike (0)";
+    labelEl.style.color = "var(--color-dislike)";
+  } else {
+    labelEl.textContent = "Unlabeled";
+    labelEl.style.color = "var(--color-warning)";
+  }
+
+  const imgEl = document.getElementById("scatter-inspector-img");
+  if (imgEl) imgEl.src = point.image_url;
+
+  inspector.classList.remove("hidden");
+}
+
+function closeScatterInspector() {
+  const inspector = document.getElementById("scatter-inspector");
+  if (inspector) inspector.classList.add("hidden");
+  selectedScatterPoint = null;
+  drawScatterPlot();
+}
+
+async function handleInspectorSetLabel(newLabel) {
+  if (!selectedScatterPoint) return;
+
+  try {
+    const res = await fetch("/api/review", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        updates: [{ id: selectedScatterPoint.id, label: newLabel, reviewed: 1 }],
+      }),
+    });
+
+    if (!res.ok) throw new Error("Failed to update sample label");
+
+    selectedScatterPoint.label = newLabel;
+    selectedScatterPoint.reviewed = 1;
+
+    // Update in scatterPoints list
+    const pt = scatterPoints.find((p) => p.id === selectedScatterPoint.id);
+    if (pt) {
+      pt.label = newLabel;
+      pt.reviewed = 1;
+    }
+
+    openScatterInspector(selectedScatterPoint);
+    drawScatterPlot();
+    showToast(`Sample #${selectedScatterPoint.id} updated to ${newLabel === 1 ? "Like" : "Dislike"}`);
+    fetchMetrics();
+  } catch (err) {
+    console.error("Error setting label from inspector:", err);
+    showToast("Failed to update label", true);
+  }
+}
+
+async function handleInspectorDeleteSample() {
+  if (!selectedScatterPoint) return;
+  if (!confirm(`Delete sample #${selectedScatterPoint.id}?`)) return;
+
+  try {
+    const res = await fetch(`/api/samples/${selectedScatterPoint.id}`, {
+      method: "DELETE",
+    });
+
+    if (!res.ok) throw new Error("Failed to delete sample");
+
+    scatterPoints = scatterPoints.filter((p) => p.id !== selectedScatterPoint.id);
+    closeScatterInspector();
+    drawScatterPlot();
+    showToast("Sample deleted successfully");
+    fetchMetrics();
+  } catch (err) {
+    console.error("Error deleting sample from inspector:", err);
+    showToast("Failed to delete sample", true);
+  }
+}
+
