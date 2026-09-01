@@ -80,8 +80,10 @@ http://localhost:8000
 
 The browser loads the dashboard, which displays:
 * The **Review Queue** tab for inspecting automated decisions.
-* The **All Samples** tab for browsing the dataset.
+* The **Samples** tab for browsing and filtering the dataset.
+* The **Embedding Space** tab for exploring 2D feature projections (PCA and t-SNE) with hover previews.
 * The **Model & Metrics** tab for tuning the decision threshold and retraining the classifier.
+* The **Console** tab for monitoring live system activity logs.
 
 To stop the server, press `Ctrl+C` in your terminal.
 
@@ -93,14 +95,17 @@ To stop the server, press `Ctrl+C` in your terminal.
 2. **Train the classification model**:
    Open the developer dashboard at `http://localhost:8000`. Click **Retrain Model** to fit the classifier on your stored dataset.
 
-3. **Tune the decision threshold**:
+3. **Explore embedding space**:
+   Switch to the **Embedding Space** tab to view your dataset projected in 2D. Toggle between **PCA** (to inspect global linear separation) and **t-SNE** (to discover style and aesthetic clusters). Hover over points to preview artwork thumbnails.
+
+4. **Tune the decision threshold**:
    Adjust the decision threshold slider in the dashboard. Lower thresholds (such as `0.35`) prioritize recall so you miss fewer likes in imbalanced libraries where likes represent only 5% to 10% of samples.
 
-4. **Run in supervised mode or full auto mode**:
+5. **Run in supervised mode or full auto mode**:
    * Press `S` on the library website to toggle supervised mode. Press `Y` to accept predictions or `N` to override them.
    * Press `A` on the library website to toggle full auto mode. The userscript rates artworks automatically according to the active decision threshold.
 
-5. **Review automated decisions**:
+6. **Review automated decisions**:
    Open the review queue tab in the developer dashboard. Inspect unreviewed samples, correct misclassified items with hotkeys (`1` for Like, `0` for Dislike), and click **Mark All Visible as Reviewed**.
 
 ## Machine learning pipeline
@@ -108,6 +113,9 @@ To stop the server, press `Ctrl+C` in your terminal.
 * **Feature extraction**: Uses the `clip-ViT-L-14` model to extract a 768-dimensional vision embedding from each primary image. Embeddings are $L_2$-normalized to unit length.
 * **Classifier**: Uses `scikit-learn` `LogisticRegression` with `class_weight='balanced'` to account for class imbalance (likes represent 5% to 10% of samples).
 * **Evaluation metrics**: Evaluates model performance using Precision-Recall Area Under Curve (PR-AUC) and the $F_2$ score, which weights recall twice as heavily as precision.
+* **Dimensionality reduction**:
+  * **PCA (2D)**: Linear projection that preserves global variance and dataset spread, displaying explained variance ratios for PC1 and PC2.
+  * **t-SNE (2D)**: Non-linear manifold learning that preserves local neighborhood similarities to reveal aesthetic sub-clusters.
 * **Inference**: Computes the predicted probability $P(\text{Like})$ between `0.0` and `1.0`. If $P \ge \theta$ (decision threshold, default `0.35`), the system classifies the artwork as a Like.
 
 ## API reference
@@ -121,6 +129,7 @@ The backend server exposes the following HTTP JSON endpoints:
 | `/api/capture` | `POST` | Captures an OS desktop screen region when the browser DOM cannot access raw image bytes. |
 | `/api/train` | `POST` | Trains the Logistic Regression model on all labeled samples in the database and returns evaluation metrics. |
 | `/api/samples` | `GET` | Queries stored samples for dashboard inspection and review, with base64 images included. |
+| `/api/embeddings/scatter` | `GET` | Computes 2D PCA or t-SNE coordinates for all sample embeddings for interactive scatter visualization. |
 | `/api/review` | `POST` | Applies batch label updates and marks samples as reviewed. |
 | `/api/metrics` | `GET` | Returns dataset distribution, confusion matrix data, and PR curves across candidate thresholds. |
 | `/api/logs` | `GET` | Retrieves real-time interaction logs for manual ratings, predictions, auto actions, and training events. |

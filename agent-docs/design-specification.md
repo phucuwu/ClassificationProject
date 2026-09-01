@@ -240,6 +240,11 @@ Bulk updates labels and review flags for items in the Review Queue.
 ### `GET /api/metrics`
 Returns dataset statistics, class balance, threshold curves, and confusion matrix data.
 
+### `GET /api/embeddings/scatter`
+Extracts 2D coordinates for dataset sample vision embeddings using PCA or t-SNE dimensionality reduction.
+* Query Parameters: `method` (`pca` or `tsne`, default `pca`).
+* Response: `{ status, total_points, method, variance_ratio, points: [{ id, image_hash, image_url, label, prediction_score, mode, reviewed, x, y, created_at }] }`.
+
 ---
 
 ## 4. Machine Learning Pipeline
@@ -294,7 +299,18 @@ Accessible at `http://localhost:8000`:
   * Press `1` on selected/hovered card to mark as Like, `0` to mark as Dislike.
   * Direct mouse click on label badge toggles between Like and Dislike.
   * "Mark All Visible as Reviewed" button.
+* **Samples View (Dataset Inspector):**
+  * Filter by mode (manual, supervised, auto) and label (Like, Dislike).
+  * Batch selection and multi-sample deletion with image cleanup.
+* **Embedding Space Visualizer:**
+  * Interactive HTML5 Canvas plotting the 768-dimensional vision embedding space in 2D.
+  * Algorithm Switcher: **PCA (2D)** for global variance preservation and linear structure, or **t-SNE (2D)** for local aesthetic neighborhood clustering.
+  * Color Modes: Color by ground truth **Label** (Emerald `#10b981` for Likes, Rose `#ef4444` for Dislikes, Amber `#f59e0b` for Unlabeled) or by **Prediction Score** gradient.
+  * Navigation: Drag to pan, scroll wheel to zoom centered at cursor, Reset View button.
+  * Hover Card: Floating tooltip card with live artwork thumbnail preview from `/images/{image_hash}.jpg`, prediction score, and mode.
+  * Side Inspector Drawer: Click any data point to open sample inspection panel with one-click relabeling (`✓ Set Like`, `✕ Set Dislike`) and deletion.
 * **Model Control & Tuning:**
   * Interactive slider for Decision Threshold ($\theta$) showing estimated Precision, Recall, and Confusion Matrix in real time.
   * "Retrain Model" button that triggers background cross-validation and updates metrics.
-* **Dataset Stats:** Total count, positive ratio, and ingestion history chart.
+* **Console View:** Real-time log stream showing system interactions, inference scores, and ratings.
+

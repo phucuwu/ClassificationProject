@@ -1260,12 +1260,35 @@ function hideScatterTooltip() {
   if (tooltip) tooltip.classList.add("hidden");
 }
 
+function formatScatterDate(dateStr) {
+  if (!dateStr) return "N/A";
+  try {
+    const d = new Date(dateStr.replace(" ", "T"));
+    if (isNaN(d.getTime())) {
+      const parts = dateStr.split(" ")[0].split("-");
+      if (parts.length === 3) {
+        return `${parts[2]}-${parts[1]}-${parts[0]}`;
+      }
+      return dateStr;
+    }
+    const day = String(d.getDate()).padStart(2, "0");
+    const month = String(d.getMonth() + 1).padStart(2, "0");
+    const year = d.getFullYear();
+    return `${day}-${month}-${year}`;
+  } catch (_) {
+    return dateStr;
+  }
+}
+
 function openScatterInspector(point) {
   const inspector = document.getElementById("scatter-inspector");
   if (!inspector) return;
 
   document.getElementById("scatter-insp-id").textContent = `#${point.id}`;
-  document.getElementById("scatter-insp-hash").textContent = `${point.image_hash.slice(0, 16)}...`;
+  const dateEl = document.getElementById("scatter-insp-date");
+  if (dateEl) {
+    dateEl.textContent = formatScatterDate(point.created_at);
+  }
   document.getElementById("scatter-insp-mode").textContent = point.mode;
   document.getElementById("scatter-insp-reviewed").textContent = point.reviewed === 1 ? "Confirmed" : "Pending";
   document.getElementById("scatter-insp-score").textContent = point.prediction_score !== null ? point.prediction_score.toFixed(4) : "N/A";
