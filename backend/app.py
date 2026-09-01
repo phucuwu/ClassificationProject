@@ -177,6 +177,9 @@ class TrainRequest(BaseModel):
     threshold: float | None = Field(None, description="Optional explicit threshold override.")
     min_recall_floor: float = Field(0.70, ge=0.05, le=0.95, description="Minimum recall floor for hybrid F2 threshold calibration.")
     holdout_ratio: float = Field(0.15, ge=0.0, le=0.50, description="Fraction of most recent samples reserved for generalization holdout.")
+    baseline_prompt_text: str | None = Field(None, description="Optional custom prompt text for the zero-shot reference baseline.")
+    baseline_image_base64: str | None = Field(None, description="Optional base64 exemplar image for the zero-shot reference baseline.")
+    reset_baseline_to_default: bool = Field(False, description="Flag to reset the reference baseline back to the default text prompt.")
 
 
 class ThresholdRequest(BaseModel):
@@ -368,15 +371,20 @@ def train_model(payload: TrainRequest = TrainRequest()) -> dict[str, Any]:
             threshold=payload.threshold,
             min_recall_floor=payload.min_recall_floor,
             holdout_ratio=payload.holdout_ratio,
+            baseline_prompt_text=payload.baseline_prompt_text,
+            baseline_image_base64=payload.baseline_image_base64,
+            reset_baseline_to_default=payload.reset_baseline_to_default,
         )
 
         if result.get("status") == "trained":
             m = result.get("metrics", {})
             eval_info = f" ({m.get('evaluation_type', 'cv')}, {m.get('folds', 5)} folds)" if m.get("folds") else ""
+            bp = m.get("best_params", {})
+            params_info = f", C={bp.get('C')}, weight={bp.get('class_weight')}" if bp else ""
             add_activity_log(
                 "SUCCESS",
                 "model_trained",
-                f"Model retrained on {result.get('sample_count')} samples: OOF PR-AUC {m.get('pr_auc')}, Recall {m.get('recall')}, θ={m.get('decision_threshold')}{eval_info}",
+                f"Model retrained on {result.get('sample_count')} samples: OOF PR-AUC {m.get('pr_auc')}, Recall {m.get('recall')}, θ={m.get('decision_threshold')}{eval_info}{params_info}",
                 details=m,
             )
             if m.get("generalization_warning"):
@@ -550,9 +558,43 @@ def get_metrics() -> dict[str, Any]:
                 "negative_count": model_data.get("negative_count", 0),
             }
         else:
+            cold_baselines = None
+            if statistics.get("positive_count", 0) >= 1 and statistics.get("negative_count", 0) >= 1:
+                try:
+                    X, y = load_training_matrix()
+                    if len(y) > 0 and np.sum(y == 1) > 0:
+                        from backend.model import DEFAULT_ZERO_SHOT_PROMPT, extract_text_embedding
+                        from sklearn.metrics import precision_recall_curve, auc
+
+                        pos_rate = float(np.sum(y == 1) / len(y))
+                        c_vec = np.mean(X[y == 1], axis=0)
+                        c_norm = np.linalg.norm(c_vec)
+                        c_vec = (c_vec / c_norm) if c_norm > 0 else c_vec
+                        c_sim = X @ c_vec
+                        cp, cr, _ = precision_recall_curve(y, c_sim)
+                        c_auc = float(auc(cr, cp)) if len(cr) > 1 else 0.0
+
+                        zs_vec = extract_text_embedding(DEFAULT_ZERO_SHOT_PROMPT)
+                        zs_sim = X @ zs_vec
+                        zp, zr, _ = precision_recall_curve(y, zs_sim)
+                        z_auc = float(auc(zr, zp)) if len(zr) > 1 else 0.0
+
+                        cold_baselines = {
+                            "random_guess": round(pos_rate, 4),
+                            "positive_centroid": round(c_auc, 4),
+                            "zero_shot": round(z_auc, 4),
+                            "reference_type": "text",
+                            "reference_source": DEFAULT_ZERO_SHOT_PROMPT,
+                            "prompt_text": DEFAULT_ZERO_SHOT_PROMPT,
+                        }
+                except Exception:
+                    cold_baselines = None
+
             model_info = {
                 "model_loaded": False,
-                "metrics": None,
+                "metrics": {
+                    "baselines": cold_baselines,
+                } if cold_baselines else None,
                 "decision_threshold": round(float(DEFAULT_DECISION_THRESHOLD), 2),
                 "message": "Model not trained yet.",
             }

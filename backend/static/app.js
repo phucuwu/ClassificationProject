@@ -4,6 +4,8 @@ let consoleLogs = [];
 let selectedCardIndex = 0;
 let activeTab = "tab-review";
 let selectedSampleIds = new Set();
+let activeExemplarBase64 = null;
+let resetBaselinePending = false;
 
 document.addEventListener("DOMContentLoaded", () => {
   initTabs();
@@ -231,6 +233,52 @@ function initEventListeners() {
   if (btnSetLike) btnSetLike.addEventListener("click", () => handleInspectorSetLabel(1));
   if (btnSetDislike) btnSetDislike.addEventListener("click", () => handleInspectorSetLabel(0));
   if (btnDeleteSample) btnDeleteSample.addEventListener("click", () => handleInspectorDeleteSample());
+
+  // Exemplar Image Upload & Baseline Reset Handlers
+  const exemplarInput = document.getElementById("input-exemplar-image");
+  const exemplarPreview = document.getElementById("exemplar-preview-container");
+  const exemplarImg = document.getElementById("exemplar-preview-img");
+  const clearExemplarBtn = document.getElementById("btn-clear-exemplar");
+  const resetBaselineBtn = document.getElementById("btn-reset-baseline");
+  const baselinePromptInput = document.getElementById("input-baseline-prompt");
+
+  if (exemplarInput) {
+    exemplarInput.addEventListener("change", (e) => {
+      const file = e.target.files && e.target.files[0];
+      if (!file) return;
+      const reader = new FileReader();
+      reader.onload = (loadEvent) => {
+        activeExemplarBase64 = loadEvent.target.result;
+        resetBaselinePending = false;
+        if (exemplarImg) exemplarImg.src = activeExemplarBase64;
+        if (exemplarPreview) exemplarPreview.classList.remove("hidden");
+        showToast("Exemplar artwork image loaded for reference baseline");
+      };
+      reader.readAsDataURL(file);
+    });
+  }
+
+  if (clearExemplarBtn) {
+    clearExemplarBtn.addEventListener("click", () => {
+      activeExemplarBase64 = null;
+      if (exemplarInput) exemplarInput.value = "";
+      if (exemplarPreview) exemplarPreview.classList.add("hidden");
+      showToast("Exemplar image cleared");
+    });
+  }
+
+  if (resetBaselineBtn) {
+    resetBaselineBtn.addEventListener("click", () => {
+      resetBaselinePending = true;
+      activeExemplarBase64 = null;
+      if (exemplarInput) exemplarInput.value = "";
+      if (exemplarPreview) exemplarPreview.classList.add("hidden");
+      if (baselinePromptInput) {
+        baselinePromptInput.value = "goth aesthetic alternative indie girl style";
+      }
+      showToast("Baseline will reset to default on next retrain");
+    });
+  }
 
   initScatterCanvas();
 
@@ -748,6 +796,111 @@ function updateMetricsDisplay(m, stats = {}) {
     `;
   }
 
+  // Evaluation Baselines Benchmark Section
+  const baselinesContainer = document.getElementById("baselines-summary-container");
+  if (baselinesContainer) {
+    const b = m.baselines;
+    if (b) {
+      const randScore = b.random_guess !== undefined ? b.random_guess.toFixed(3) : "0.000";
+      const centScore = b.positive_centroid !== undefined ? b.positive_centroid.toFixed(3) : "0.000";
+      const zsScore = b.zero_shot !== undefined ? b.zero_shot.toFixed(3) : "0.000";
+      const modelScore = m.pr_auc !== undefined ? m.pr_auc.toFixed(3) : "0.000";
+
+      const randPct = Math.min(100, Math.max(2, (b.random_guess || 0) * 100)).toFixed(1);
+      const centPct = Math.min(100, Math.max(2, (b.positive_centroid || 0) * 100)).toFixed(1);
+      const zsPct = Math.min(100, Math.max(2, (b.zero_shot || 0) * 100)).toFixed(1);
+      const modelPct = Math.min(100, Math.max(2, (m.pr_auc || 0) * 100)).toFixed(1);
+
+      const isImageRef = b.reference_type === "image";
+      const zsLabel = isImageRef ? "Exemplar Image Baseline" : "Zero-Shot Text Prompt";
+      const zsSource = b.reference_source || "goth aesthetic alternative indie girl style";
+      const zsSourceDisplay = zsSource.length > 32 ? zsSource.substring(0, 32) + "..." : zsSource;
+
+      const bp = m.best_params;
+      const bpText = bp ? `C=${bp.C}, ${bp.class_weight}` : "C=1.0, balanced";
+
+      baselinesContainer.innerHTML = `
+        <div class="baselines-header">
+          <div class="baselines-title">
+            <span>📊 Evaluation Baselines Benchmark</span>
+          </div>
+          <span class="baselines-tuned-chip" title="Hyperparameters tuned via Stratified Cross-Validation on PR-AUC">Tuned: ${bpText}</span>
+        </div>
+        <div class="baselines-list">
+          <!-- 1. Random Guess -->
+          <div class="baseline-row">
+            <div class="baseline-row-header">
+              <span class="baseline-name">
+                🎲 Random Guess Baseline
+                <span class="baseline-badge-tag">Prevalence</span>
+              </span>
+              <span class="baseline-val" style="color: #94a3b8;">${randScore}</span>
+            </div>
+            <div class="baseline-track">
+              <div class="baseline-fill" style="width: ${randPct}%; background: #64748b;"></div>
+            </div>
+          </div>
+
+          <!-- 2. Positive Centroid -->
+          <div class="baseline-row">
+            <div class="baseline-row-header">
+              <span class="baseline-name">
+                🎯 Positive Class Centroid
+                <span class="baseline-badge-tag">Cosine Sim</span>
+              </span>
+              <span class="baseline-val" style="color: #fbbf24;">${centScore}</span>
+            </div>
+            <div class="baseline-track">
+              <div class="baseline-fill" style="width: ${centPct}%; background: #f59e0b;"></div>
+            </div>
+          </div>
+
+          <!-- 3. Zero-Shot Prompt / Exemplar -->
+          <div class="baseline-row">
+            <div class="baseline-row-header">
+              <span class="baseline-name">
+                ${isImageRef ? '🖼️' : '✨'} ${zsLabel}
+                <span class="baseline-badge-tag" title="${zsSource}">${zsSourceDisplay}</span>
+              </span>
+              <span class="baseline-val" style="color: #38bdf8;">${zsScore}</span>
+            </div>
+            <div class="baseline-track">
+              <div class="baseline-fill" style="width: ${zsPct}%; background: #38bdf8;"></div>
+            </div>
+          </div>
+
+          <!-- 4. Trained Logistic Regression Model -->
+          <div class="baseline-row">
+            <div class="baseline-row-header">
+              <span class="baseline-name" style="font-weight: 600; color: var(--text-primary);">
+                ⚡ Logistic Regression Classifier
+                <span class="baseline-badge-tag" style="background: rgba(168, 85, 247, 0.2); color: #d8b4fe;">OOF PR-AUC</span>
+              </span>
+              <span class="baseline-val" style="color: #c084fc;">${modelScore}</span>
+            </div>
+            <div class="baseline-track">
+              <div class="baseline-fill" style="width: ${modelPct}%; background: #a855f7;"></div>
+            </div>
+          </div>
+        </div>
+        <div class="baseline-footer-text">
+          Benchmarked against naive and zero-shot reference baselines. Model achieves ${((m.pr_auc || 0) / (b.random_guess || 0.001)).toFixed(1)}× lift over random guessing.
+        </div>
+      `;
+    } else {
+      baselinesContainer.innerHTML = `
+        <div class="baselines-header">
+          <div class="baselines-title">
+            <span>📊 Evaluation Baselines Benchmark</span>
+          </div>
+        </div>
+        <div class="baseline-footer-text">
+          Evaluation baselines will populate when model is trained or labeled samples are present.
+        </div>
+      `;
+    }
+  }
+
   // Holdout Verification Section
   if (holdoutContainer) {
     if (m.holdout) {
@@ -896,6 +1049,17 @@ function renderModelTab(model, stats) {
     const folds = model.metrics.folds || 5;
     heroEvalChip.textContent = model.metrics.evaluation_type === "stratified_cv" ? `Stratified ${folds}-Fold OOF CV` : "In-Sample Evaluation";
   }
+  const heroTuningChip = document.getElementById("hero-tuning-chip");
+  if (heroTuningChip) {
+    const bp = model.metrics.best_params;
+    if (bp) {
+      heroTuningChip.textContent = `Tuning: C=${bp.C}, ${bp.class_weight}`;
+      heroTuningChip.style.display = "inline-flex";
+    } else {
+      heroTuningChip.textContent = "Tuning: C=1.0, balanced";
+      heroTuningChip.style.display = "inline-flex";
+    }
+  }
   if (heroMeta) {
     const total = stats.total_samples || (model.positive_count + model.negative_count);
     const pos = model.positive_count || stats.positive_count || 0;
@@ -906,6 +1070,15 @@ function renderModelTab(model, stats) {
       <span class="hero-stat-pill likes"><strong>${pos}</strong> Likes (${ratio}%)</span>
       <span class="hero-stat-pill dislikes"><strong>${neg}</strong> Dislikes</span>
     `;
+  }
+
+  // Update prompt input default value if available in model baselines
+  const baselinePromptInput = document.getElementById("input-baseline-prompt");
+  if (baselinePromptInput && document.activeElement !== baselinePromptInput && model.metrics?.baselines) {
+    const b = model.metrics.baselines;
+    if (b.reference_type === "text" && b.prompt_text) {
+      baselinePromptInput.value = b.prompt_text;
+    }
   }
 
   updateMetricsDisplay(model.metrics, stats);
@@ -998,8 +1171,14 @@ async function handleRetrainModel() {
   const thresholdSlider = document.getElementById("slider-threshold");
   const currentThreshold = thresholdSlider && !isNaN(parseFloat(thresholdSlider.value)) ? parseFloat(thresholdSlider.value) : null;
 
+  const baselinePromptInput = document.getElementById("input-baseline-prompt");
+  const baselinePrompt = baselinePromptInput ? baselinePromptInput.value.trim() : null;
+
   let payload = {
     holdout_ratio: holdoutRatio,
+    baseline_prompt_text: baselinePrompt || null,
+    baseline_image_base64: activeExemplarBase64 || null,
+    reset_baseline_to_default: resetBaselinePending,
   };
 
   if (strat === "hybrid") {
@@ -1039,6 +1218,7 @@ async function handleRetrainModel() {
       showToast("Training completed");
       await fetchMetrics();
     }
+    resetBaselinePending = false;
   } catch (err) {
     console.error("Error training model:", err);
     showToast(`Model training failed: ${err.message || err}`, true);

@@ -29,6 +29,8 @@ MODEL_PATH = DATA_DIR / "model.pkl"
 CLIP_MODEL_NAME = "clip-ViT-L-14"
 EMBEDDING_DIM = 768
 DEFAULT_DECISION_THRESHOLD = 0.35
+DEFAULT_ZERO_SHOT_PROMPT = "goth aesthetic alternative indie girl style"
+HYPERPARAMETER_C_GRID = [0.01, 0.1, 0.5, 1.0, 2.0, 5.0, 10.0]
 
 # Global lazy-loaded embedding model instance
 _EMBEDDING_MODEL = None
@@ -77,6 +79,47 @@ def extract_vision_embedding(image_input: Image.Image | bytes | str) -> np.ndarr
     return embedding.astype(np.float32)
 
 
+def extract_text_embedding(text: str) -> np.ndarray:
+    """Extract a 768-dimensional L2-normalized float32 text embedding using CLIP.
+
+    Args:
+        text: Prompt text string to encode.
+
+    Returns:
+        A 768-dimensional float32 NumPy array with unit L2 norm.
+    """
+    model = get_embedding_model()
+    embedding = model.encode(text, convert_to_numpy=True, normalize_embeddings=True)
+    return embedding.astype(np.float32)
+
+
+def get_candidate_class_weights(y_train: np.ndarray) -> list[tuple[str, Any]]:
+    """Generate candidate class weight configurations adapted to class distribution.
+
+    Args:
+        y_train: Binary label vector for training partition.
+
+    Returns:
+        List of (weight_key, class_weight_param) tuples.
+    """
+    pos_count = int(np.sum(y_train == 1))
+    neg_count = int(np.sum(y_train == 0))
+
+    if pos_count == 0 or neg_count == 0:
+        return [("balanced", "balanced"), ("unweighted", None)]
+
+    ratio = float(neg_count / pos_count)
+    w_balanced_1_5x = {0: 1.0, 1: float(1.5 * ratio)}
+    w_balanced_2_0x = {0: 1.0, 1: float(2.0 * ratio)}
+
+    return [
+        ("balanced", "balanced"),
+        ("unweighted", None),
+        ("balanced_1.5x", w_balanced_1_5x),
+        ("balanced_2.0x", w_balanced_2_0x),
+    ]
+
+
 def train_taste_classifier(
     X: np.ndarray,
     y: np.ndarray,
@@ -84,6 +127,9 @@ def train_taste_classifier(
     threshold: float | None = None,
     min_recall_floor: float = 0.70,
     holdout_ratio: float = 0.15,
+    baseline_prompt_text: str | None = None,
+    baseline_image_base64: str | None = None,
+    reset_baseline_to_default: bool = False,
     model_path: Path | str | None = None,
 ) -> dict[str, Any]:
     """Fit a balanced Logistic Regression classifier on feature matrix X and label vector y.
@@ -162,26 +208,85 @@ def train_taste_classifier(
     dev_pos = int(np.sum(y_dev == 1))
     dev_neg = int(np.sum(y_dev == 0))
 
-    # 2. Cross-validation fold adaptation
+    # 2. Hyperparameter search over C and candidate class weights
     n_splits = min(5, dev_pos, dev_neg)
     oof_probabilities = np.zeros(len(y_dev), dtype=np.float32)
+    tuning_results: list[dict[str, Any]] = []
 
     if n_splits >= 2:
         eval_type = "stratified_cv"
         skf = StratifiedKFold(n_splits=n_splits, shuffle=True, random_state=42)
-        for train_idx, val_idx in skf.split(X_dev, y_dev):
-            fold_clf = LogisticRegression(
-                class_weight="balanced",
-                C=1.0,
-                max_iter=1000,
-                solver="lbfgs",
-                random_state=42,
-            )
-            fold_clf.fit(X_dev[train_idx], y_dev[train_idx])
-            oof_probabilities[val_idx] = fold_clf.predict_proba(X_dev[val_idx])[:, 1]
+        splits = list(skf.split(X_dev, y_dev))
+        class_weight_candidates = get_candidate_class_weights(y_dev)
+
+        oof_probs_by_config: dict[tuple[float, str], np.ndarray] = {}
+
+        for cand_c in HYPERPARAMETER_C_GRID:
+            for weight_key, weight_param in class_weight_candidates:
+                cand_oof_probs = np.zeros(len(y_dev), dtype=np.float32)
+                for train_idx, val_idx in splits:
+                    fold_clf = LogisticRegression(
+                        C=cand_c,
+                        class_weight=weight_param,
+                        max_iter=1000,
+                        solver="lbfgs",
+                        random_state=42,
+                    )
+                    fold_clf.fit(X_dev[train_idx], y_dev[train_idx])
+                    cand_oof_probs[val_idx] = fold_clf.predict_proba(X_dev[val_idx])[:, 1]
+
+                c_prec, c_rec, _ = precision_recall_curve(y_dev, cand_oof_probs)
+                c_pr_auc = float(auc(c_rec, c_prec)) if len(c_rec) > 1 else 0.0
+                c_ap = float(average_precision_score(y_dev, cand_oof_probs)) if len(np.unique(y_dev)) > 1 else 0.0
+
+                config_key = (cand_c, weight_key)
+                oof_probs_by_config[config_key] = cand_oof_probs
+                tuning_results.append({
+                    "C": cand_c,
+                    "class_weight": weight_key,
+                    "pr_auc": round(c_pr_auc, 4),
+                    "average_precision": round(c_ap, 4),
+                })
+
+        # Rank configs: highest PR-AUC, then AP, then closest to C=1.0, then balanced
+        tuning_results.sort(
+            key=lambda r: (
+                r["pr_auc"],
+                r["average_precision"],
+                -abs(r["C"] - 1.0),
+                1 if r["class_weight"] == "balanced" else 0,
+            ),
+            reverse=True,
+        )
+
+        best_config = tuning_results[0]
+        best_C = float(best_config["C"])
+        best_weight_key = str(best_config["class_weight"])
+        best_weight_param = next(w[1] for w in class_weight_candidates if w[0] == best_weight_key)
+        oof_probabilities = oof_probs_by_config[(best_C, best_weight_key)]
+
+        # Out-of-fold centroid cosine similarity baseline
+        oof_centroid_scores = np.zeros(len(y_dev), dtype=np.float32)
+        for train_idx, val_idx in splits:
+            pos_mask = (y_dev[train_idx] == 1)
+            if np.any(pos_mask):
+                c_vec = np.mean(X_dev[train_idx][pos_mask], axis=0)
+                norm = np.linalg.norm(c_vec)
+                c_vec = (c_vec / norm) if norm > 0 else c_vec
+                oof_centroid_scores[val_idx] = X_dev[val_idx] @ c_vec
+            else:
+                oof_centroid_scores[val_idx] = 0.0
+
+        cent_prec, cent_rec, _ = precision_recall_curve(y_dev, oof_centroid_scores)
+        centroid_pr_auc = float(auc(cent_rec, cent_prec)) if len(cent_rec) > 1 else 0.0
+
     else:
         # Cold start fallback when positive count < 2
         eval_type = "in_sample_fallback"
+        best_C = 1.0
+        best_weight_key = "balanced"
+        best_weight_param = "balanced"
+
         fold_clf = LogisticRegression(
             class_weight="balanced",
             C=1.0,
@@ -192,12 +297,73 @@ def train_taste_classifier(
         fold_clf.fit(X_dev, y_dev)
         oof_probabilities[:] = fold_clf.predict_proba(X_dev)[:, 1]
 
-    # 3. Out-of-fold Precision-Recall curve and metrics
+        c_prec, c_rec, _ = precision_recall_curve(y_dev, oof_probabilities)
+        c_pr_auc = float(auc(c_rec, c_prec)) if len(c_rec) > 1 else 0.0
+        c_ap = float(average_precision_score(y_dev, oof_probabilities)) if len(np.unique(y_dev)) > 1 else 0.0
+        tuning_results.append({
+            "C": 1.0,
+            "class_weight": "balanced",
+            "pr_auc": round(c_pr_auc, 4),
+            "average_precision": round(c_ap, 4),
+        })
+
+        # In-sample centroid baseline fallback
+        pos_mask = (y_dev == 1)
+        if np.any(pos_mask):
+            c_vec = np.mean(X_dev[pos_mask], axis=0)
+            norm = np.linalg.norm(c_vec)
+            c_vec = (c_vec / norm) if norm > 0 else c_vec
+            in_sample_scores = X_dev @ c_vec
+            cent_prec, cent_rec, _ = precision_recall_curve(y_dev, in_sample_scores)
+            centroid_pr_auc = float(auc(cent_rec, cent_prec)) if len(cent_rec) > 1 else 0.0
+        else:
+            centroid_pr_auc = 0.0
+
+    # 3. Reference baselines calculation
+    random_guess_pr_auc = round(float(dev_pos / len(y_dev)), 4) if len(y_dev) > 0 else 0.0
+
+    # Zero-shot text prompt or exemplar image reference baseline
+    prior_model = load_classifier(actual_model_path)
+    if reset_baseline_to_default:
+        ref_type = "text"
+        ref_source = DEFAULT_ZERO_SHOT_PROMPT
+        v_ref = extract_text_embedding(DEFAULT_ZERO_SHOT_PROMPT)
+    elif baseline_image_base64:
+        ref_type = "image"
+        ref_source = "exemplar_image"
+        v_ref = extract_vision_embedding(baseline_image_base64)
+    elif baseline_prompt_text and baseline_prompt_text.strip():
+        ref_type = "text"
+        ref_source = baseline_prompt_text.strip()
+        v_ref = extract_text_embedding(baseline_prompt_text.strip())
+    elif prior_model and prior_model.get("reference_embedding") is not None:
+        ref_type = prior_model.get("reference_type", "text")
+        ref_source = prior_model.get("reference_source", DEFAULT_ZERO_SHOT_PROMPT)
+        v_ref = np.array(prior_model["reference_embedding"], dtype=np.float32)
+    else:
+        ref_type = "text"
+        ref_source = DEFAULT_ZERO_SHOT_PROMPT
+        v_ref = extract_text_embedding(DEFAULT_ZERO_SHOT_PROMPT)
+
+    zs_scores = X_dev @ v_ref
+    zs_prec, zs_rec, _ = precision_recall_curve(y_dev, zs_scores)
+    zero_shot_pr_auc = float(auc(zs_rec, zs_prec)) if len(zs_rec) > 1 else 0.0
+
+    baselines = {
+        "random_guess": round(random_guess_pr_auc, 4),
+        "positive_centroid": round(centroid_pr_auc, 4),
+        "zero_shot": round(zero_shot_pr_auc, 4),
+        "reference_type": ref_type,
+        "reference_source": ref_source,
+        "prompt_text": ref_source if ref_type == "text" else DEFAULT_ZERO_SHOT_PROMPT,
+    }
+
+    # 4. Out-of-fold Precision-Recall curve and metrics
     precisions, recalls, pr_thresholds = precision_recall_curve(y_dev, oof_probabilities)
     pr_auc_score = float(auc(recalls, precisions)) if len(recalls) > 1 else 0.0
     ap_score = float(average_precision_score(y_dev, oof_probabilities)) if len(np.unique(y_dev)) > 1 else 0.0
 
-    # 4. Calibrate decision threshold
+    # 5. Calibrate decision threshold
     if threshold is not None:
         calibrated_threshold = float(round(float(np.clip(threshold, 0.05, 0.95)), 2))
     elif target_recall is not None:
@@ -214,7 +380,7 @@ def train_taste_classifier(
         # Hybrid calibration: maximize F2 with an enforced recall floor (default 0.70)
         calibrated_threshold = DEFAULT_DECISION_THRESHOLD
         candidate_cutoffs = np.linspace(0.05, 0.95, 91)
-        valid_candidates: list[tuple[float, float, float]] = []  # (f2, recall, cutoff)
+        valid_candidates: list[tuple[float, float, float]] = []
         all_candidates: list[tuple[float, float, float]] = []
 
         for cutoff in candidate_cutoffs:
@@ -228,11 +394,9 @@ def train_taste_classifier(
                 valid_candidates.append((c_f2, c_rec, float(cutoff)))
 
         if valid_candidates:
-            # Sort by F2 descending, then cutoff descending (higher precision for equal F2)
             valid_candidates.sort(key=lambda item: (item[0], item[2]), reverse=True)
             calibrated_threshold = valid_candidates[0][2]
         elif all_candidates:
-            # Fallback: cutoff achieving highest recall, then highest F2
             all_candidates.sort(key=lambda item: (item[1], item[0]), reverse=True)
             calibrated_threshold = all_candidates[0][2]
 
@@ -249,11 +413,11 @@ def train_taste_classifier(
     prec = float(tp / (tp + fp)) if (tp + fp) > 0 else 0.0
     f2 = float(fbeta_score(y_dev, binary_preds, beta=2, zero_division=0))
 
-    # 5. Holdout generalization verification
+    # 6. Holdout generalization verification
     if use_holdout and X_holdout is not None and y_holdout is not None:
         dev_clf = LogisticRegression(
-            class_weight="balanced",
-            C=1.0,
+            class_weight=best_weight_param,
+            C=best_C,
             max_iter=1000,
             solver="lbfgs",
             random_state=42,
@@ -275,7 +439,6 @@ def train_taste_classifier(
         h_prec = float(h_tp / (h_tp + h_fp)) if (h_tp + h_fp) > 0 else 0.0
         h_f2 = float(fbeta_score(y_holdout, h_preds, beta=2, zero_division=0))
 
-        # Check generalization: PR-AUC drop > 0.25 triggers warning
         generalization_warning = bool(h_pr_auc < (pr_auc_score - 0.25))
 
         holdout_metrics = {
@@ -296,10 +459,10 @@ def train_taste_classifier(
             "generalization_warning": generalization_warning,
         }
 
-    # 6. Fit final model on 100% of labeled data
+    # 7. Fit final model on 100% of labeled data
     final_classifier = LogisticRegression(
-        class_weight="balanced",
-        C=1.0,
+        class_weight=best_weight_param,
+        C=best_C,
         max_iter=1000,
         solver="lbfgs",
         random_state=42,
@@ -323,6 +486,12 @@ def train_taste_classifier(
         "folds": n_splits if eval_type == "stratified_cv" else None,
         "holdout": holdout_metrics,
         "generalization_warning": generalization_warning,
+        "best_params": {
+            "C": best_C,
+            "class_weight": best_weight_key,
+        },
+        "tuning_summary": tuning_results,
+        "baselines": baselines,
     }
 
     # Save model artifact
@@ -335,6 +504,9 @@ def train_taste_classifier(
         "negative_count": negative_count,
         "oof_probabilities": oof_probabilities.tolist(),
         "y_oof": y_dev.tolist(),
+        "reference_embedding": v_ref.tolist(),
+        "reference_type": ref_type,
+        "reference_source": ref_source,
     }
     with open(actual_model_path, "wb") as f:
         pickle.dump(model_payload, f)
@@ -424,6 +596,9 @@ def update_decision_threshold(
         "folds": existing_metrics.get("folds"),
         "holdout": existing_metrics.get("holdout"),
         "generalization_warning": existing_metrics.get("generalization_warning", False),
+        "best_params": existing_metrics.get("best_params"),
+        "tuning_summary": existing_metrics.get("tuning_summary"),
+        "baselines": existing_metrics.get("baselines"),
     }
 
     model_data["decision_threshold"] = clamped_threshold
