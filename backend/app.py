@@ -27,6 +27,8 @@ from backend.database import (
     get_samples,
     init_db,
     insert_sample,
+    find_near_duplicate,
+    update_sample_record,
     load_training_matrix,
     load_embedding_scatter_data,
     update_sample_reviews,
@@ -36,6 +38,8 @@ from sklearn.decomposition import PCA
 from sklearn.manifold import TSNE
 from backend.model import (
     DEFAULT_DECISION_THRESHOLD,
+    detect_positive_outliers,
+    detect_negative_outliers,
     extract_vision_embedding,
     load_classifier,
     predict_taste,
@@ -242,9 +246,51 @@ def _decode_and_save_image(image_base64: str) -> tuple[bytes, str, Path]:
 def record_sample(payload: RecordRequest) -> dict[str, Any]:
     """Ingest a sample with an image, label, and mode. Extracts and saves the vision embedding."""
     try:
-        image_bytes, image_hash, file_path = _decode_and_save_image(payload.image_base64)
+        raw_str = payload.image_base64
+        if "," in raw_str:
+            raw_str = raw_str.split(",", 1)[1]
+        image_bytes = base64.b64decode(raw_str)
         embedding = extract_vision_embedding(image_bytes)
 
+        # Check for near-duplicate artwork before saving new image file or inserting row
+        near_dup = find_near_duplicate(embedding, threshold=0.98)
+        label_str = "LIKE (1)" if payload.label == 1 else ("DISLIKE (0)" if payload.label == 0 else "UNLABELED")
+        set_str = f" [Set: {payload.image_set_count} photos]" if payload.image_set_count and payload.image_set_count > 1 else ""
+
+        if near_dup is not None:
+            canonical_id = int(near_dup["id"])
+            update_sample_record(
+                canonical_id,
+                label=payload.label,
+                mode=payload.mode,
+                prediction_score=payload.prediction_score,
+                reviewed=payload.reviewed,
+            )
+            sim_val = float(near_dup["similarity"])
+            add_activity_log(
+                "INFO",
+                "duplicate_consolidated",
+                f"Near-duplicate artwork detected (sim={sim_val:.4f} with #{canonical_id}): consolidated into sample #{canonical_id} as {label_str}{set_str}",
+                mode=payload.mode,
+                details={
+                    "id": canonical_id,
+                    "similarity": sim_val,
+                    "image_hash": near_dup["image_hash"],
+                    "label": payload.label,
+                    "image_set_count": payload.image_set_count,
+                },
+            )
+            return {
+                "status": "consolidated",
+                "id": canonical_id,
+                "duplicate_of": canonical_id,
+                "similarity": sim_val,
+                "image_hash": near_dup["image_hash"],
+                "label": payload.label,
+            }
+
+        # If not a near-duplicate, save image to disk and insert new sample
+        _, image_hash, file_path = _decode_and_save_image(payload.image_base64)
         rel_path = f"data/images/{image_hash}.jpg"
         sample_id = insert_sample(
             image_hash=image_hash,
@@ -255,9 +301,6 @@ def record_sample(payload: RecordRequest) -> dict[str, Any]:
             prediction_score=payload.prediction_score,
             reviewed=payload.reviewed,
         )
-
-        label_str = "LIKE (1)" if payload.label == 1 else ("DISLIKE (0)" if payload.label == 0 else "UNLABELED")
-        set_str = f" [Set: {payload.image_set_count} photos]" if payload.image_set_count and payload.image_set_count > 1 else ""
 
         if payload.mode == "manual":
             add_activity_log(
@@ -363,10 +406,11 @@ def capture_screen_region(payload: CaptureRequest) -> dict[str, Any]:
 def train_model(payload: TrainRequest = TrainRequest()) -> dict[str, Any]:
     """Train the balanced Logistic Regression model on all labeled samples in the database."""
     try:
-        X, y = load_training_matrix()
+        X, y, sample_ids = load_training_matrix(return_ids=True)
         result = train_taste_classifier(
             X,
             y,
+            sample_ids=sample_ids,
             target_recall=payload.target_recall,
             threshold=payload.threshold,
             min_recall_floor=payload.min_recall_floor,
@@ -439,11 +483,67 @@ def query_samples(
     mode: str | None = Query(None, description="Filter by mode: 'manual', 'supervised', or 'auto'."),
     reviewed: int | None = Query(None, description="Filter by review status: 1 or 0."),
     label: int | None = Query(None, description="Filter by label: 1 or 0."),
+    quality: str | None = Query(None, description="Quality filter: 'inconsistent_likes' or 'inconsistent_dislikes'."),
+    outliers_only: bool = Query(False, description="Filter only positive class outlier samples."),
+    outlier: bool | None = Query(None, description="Alias for outliers_only filter."),
     limit: int = Query(50, ge=1, le=200, description="Max number of samples to return."),
     offset: int = Query(0, ge=0, description="Query offset."),
 ) -> list[dict[str, Any]]:
     """Query samples for the dashboard review queue with base64 encoded images included."""
-    samples = get_samples(mode=mode, reviewed=reviewed, label=label, limit=limit, offset=offset)
+    filter_likes = (quality == "inconsistent_likes") or outliers_only or bool(outlier)
+    filter_dislikes = (quality == "inconsistent_dislikes")
+
+    outlier_map: dict[int, dict[str, Any]] = {}
+    target_ids: list[int] | None = None
+
+    try:
+        import numpy as np
+        X_all, y_all, ids_all = load_training_matrix(return_ids=True)
+        if len(y_all) > 0:
+            if filter_likes:
+                if np.any(y_all == 1):
+                    outlier_map = detect_positive_outliers(X_all, y_all, sample_ids=ids_all)
+                    target_ids = [s_id for s_id, data in outlier_map.items() if data.get("is_outlier")]
+                else:
+                    target_ids = []
+            elif filter_dislikes:
+                if np.any(y_all == 0):
+                    outlier_map = detect_negative_outliers(X_all, y_all, sample_ids=ids_all)
+                    target_ids = [s_id for s_id, data in outlier_map.items() if data.get("is_outlier")]
+                else:
+                    target_ids = []
+            else:
+                if np.any(y_all == 1):
+                    pos_map = detect_positive_outliers(X_all, y_all, sample_ids=ids_all)
+                    outlier_map.update(pos_map)
+                if np.any(y_all == 0):
+                    neg_map = detect_negative_outliers(X_all, y_all, sample_ids=ids_all)
+                    outlier_map.update(neg_map)
+    except Exception:
+        outlier_map = {}
+        if filter_likes or filter_dislikes:
+            target_ids = []
+
+    if filter_likes or filter_dislikes:
+        if not target_ids:
+            return []
+        target_label = 1 if filter_likes else 0
+        samples = get_samples(
+            sample_ids=target_ids,
+            mode=mode,
+            reviewed=reviewed,
+            label=target_label,
+            limit=limit,
+            offset=offset,
+        )
+    else:
+        samples = get_samples(
+            mode=mode,
+            reviewed=reviewed,
+            label=label,
+            limit=limit,
+            offset=offset,
+        )
 
     import backend.database as _db
     images_dir = Path(_db.IMAGES_DIR)
@@ -470,6 +570,20 @@ def query_samples(
 
         sample_data = dict(sample)
         sample_data["image_base64"] = b64_image
+
+        s_id = sample_data["id"]
+        if s_id in outlier_map:
+            out_info = outlier_map[s_id]
+            sample_data["is_outlier"] = bool(out_info.get("is_outlier", False))
+            sample_data["outlier_type"] = out_info.get("outlier_type")
+            sample_data["outlier_reason"] = out_info.get("outlier_reason")
+            sample_data["centroid_distance"] = out_info.get("centroid_distance")
+        else:
+            sample_data["is_outlier"] = False
+            sample_data["outlier_type"] = None
+            sample_data["outlier_reason"] = None
+            sample_data["centroid_distance"] = None
+
         results.append(sample_data)
 
     return results

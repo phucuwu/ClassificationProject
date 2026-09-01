@@ -77,10 +77,12 @@ function initEventListeners() {
   // Dataset Inspector Filters
   const sampleModeFilter = document.getElementById("filter-sample-mode");
   const sampleLabelFilter = document.getElementById("filter-sample-label");
+  const sampleOutlierFilter = document.getElementById("filter-sample-outlier");
   const refreshSamplesBtn = document.getElementById("btn-refresh-samples");
 
   if (sampleModeFilter) sampleModeFilter.addEventListener("change", fetchDatasetSamples);
   if (sampleLabelFilter) sampleLabelFilter.addEventListener("change", fetchDatasetSamples);
+  if (sampleOutlierFilter) sampleOutlierFilter.addEventListener("change", fetchDatasetSamples);
   if (refreshSamplesBtn) refreshSamplesBtn.addEventListener("click", fetchDatasetSamples);
 
   // Batch Selection Controls
@@ -376,12 +378,18 @@ async function fetchReviewQueue() {
 }
 
 async function fetchDatasetSamples() {
-  const mode = document.getElementById("filter-sample-mode").value;
-  const label = document.getElementById("filter-sample-label").value;
+  const mode = document.getElementById("filter-sample-mode") ? document.getElementById("filter-sample-mode").value : "";
+  const label = document.getElementById("filter-sample-label") ? document.getElementById("filter-sample-label").value : "";
+  const outlierVal = document.getElementById("filter-sample-outlier") ? document.getElementById("filter-sample-outlier").value : "";
 
   const params = new URLSearchParams();
   if (mode) params.append("mode", mode);
   if (label) params.append("label", label);
+  if (outlierVal === "outliers" || outlierVal === "inconsistent_likes") {
+    params.append("quality", "inconsistent_likes");
+  } else if (outlierVal === "inconsistent_dislikes") {
+    params.append("quality", "inconsistent_dislikes");
+  }
   params.append("limit", "100");
 
   try {
@@ -548,10 +556,62 @@ function renderSamplesGrid() {
 
   currentSamples.forEach((sample) => {
     const isSelected = selectedSampleIds.has(sample.id);
+    const isOutlier = Boolean(sample.is_outlier);
+    const isDislikeOutlier = isOutlier && (sample.outlier_type === "dislike" || sample.label === 0);
     const card = document.createElement("div");
-    card.className = `artwork-card ${isSelected ? "is-selected" : ""}`;
+    card.className = `artwork-card ${isSelected ? "is-selected" : ""} ${isOutlier ? (isDislikeOutlier ? "is-outlier-card is-outlier-dislike" : "is-outlier-card is-outlier-like") : ""}`;
     card.dataset.id = sample.id;
     const isLike = sample.label === 1;
+
+    let outlierBadgeHtml = "";
+    let outlierActionHtml = "";
+    if (isOutlier) {
+      let reasonText = "Inconsistent Rating";
+      const sc = sample.prediction_score !== null ? (sample.prediction_score * 100).toFixed(0) + "%" : "-";
+      const distStr = sample.centroid_distance != null ? sample.centroid_distance.toFixed(2) : "";
+
+      if (isDislikeOutlier) {
+        if (sample.outlier_reason === "distance") {
+          reasonText = `Dist ${distStr} > 2σ`;
+        } else if (sample.outlier_reason === "high_score") {
+          reasonText = `Score ${sc} ≥ θ`;
+        } else if (sample.outlier_reason === "both") {
+          reasonText = `Dist > 2σ & Score ${sc} ≥ θ`;
+        }
+        outlierBadgeHtml = `
+          <div class="badge-outlier badge-outlier-dislike" title="Inconsistent dislike: ${reasonText}. Click Relabel below to convert to Like.">
+            ⚠️ OUTLIER: ${reasonText}
+          </div>
+        `;
+        outlierActionHtml = `
+          <div class="card-outlier-actions">
+            <button class="btn-outlier-relabel btn-relabel-like" data-id="${sample.id}" title="Relabel sample #${sample.id} to Like (1)">
+              ✓ Relabel to Like (1)
+            </button>
+          </div>
+        `;
+      } else {
+        if (sample.outlier_reason === "distance") {
+          reasonText = `Dist ${distStr} > 2σ`;
+        } else if (sample.outlier_reason === "low_score") {
+          reasonText = `Score ${sc} < 0.20`;
+        } else if (sample.outlier_reason === "both") {
+          reasonText = `Dist > 2σ & Score < 0.20`;
+        }
+        outlierBadgeHtml = `
+          <div class="badge-outlier" title="Inconsistent like: ${reasonText}. Click Relabel below to prune.">
+            ⚠️ OUTLIER: ${reasonText}
+          </div>
+        `;
+        outlierActionHtml = `
+          <div class="card-outlier-actions">
+            <button class="btn-outlier-relabel btn-relabel-dislike" data-id="${sample.id}" title="Relabel sample #${sample.id} to Dislike (0)">
+              ✕ Relabel to Dislike (0)
+            </button>
+          </div>
+        `;
+      }
+    }
 
     card.innerHTML = `
       <div class="card-media">
@@ -564,6 +624,7 @@ function renderSamplesGrid() {
         <div class="badge-overlay ${isLike ? 'badge-like' : 'badge-dislike'}">
           ${isLike ? 'LIKE' : 'DISLIKE'}
         </div>
+        ${outlierBadgeHtml}
       </div>
       <div class="card-body">
         <div class="card-meta-row">
@@ -574,6 +635,7 @@ function renderSamplesGrid() {
           <span>Reviewed: ${sample.reviewed === 1 ? 'Yes' : 'Pending'}</span>
           <span>Score: ${sample.prediction_score !== null ? (sample.prediction_score * 100).toFixed(0) + '%' : '-'}</span>
         </div>
+        ${outlierActionHtml}
       </div>
     `;
 
@@ -593,6 +655,16 @@ function renderSamplesGrid() {
       handleDeleteSingleSample(sample.id, false);
     });
 
+    // Relabel outlier button
+    const relabelBtn = card.querySelector(".btn-outlier-relabel");
+    if (relabelBtn) {
+      const targetLabel = isLike ? 0 : 1;
+      relabelBtn.addEventListener("click", (e) => {
+        e.stopPropagation();
+        handleQuickRelabel(sample.id, targetLabel);
+      });
+    }
+
     // Clicking card toggles selection
     card.addEventListener("click", () => {
       const willSelect = !selectedSampleIds.has(sample.id);
@@ -601,6 +673,26 @@ function renderSamplesGrid() {
 
     grid.appendChild(card);
   });
+}
+
+async function handleQuickRelabel(sampleId, newLabel) {
+  try {
+    const res = await fetch("/api/review", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        updates: [{ id: sampleId, label: newLabel, reviewed: 1 }],
+      }),
+    });
+    if (!res.ok) throw new Error("Failed to relabel sample");
+    const labelStr = newLabel === 1 ? "Like (1)" : "Dislike (0)";
+    showToast(`Sample #${sampleId} relabeled as ${labelStr}`);
+    await fetchDatasetSamples();
+    await fetchMetrics();
+  } catch (err) {
+    console.error("Error relabeling sample:", err);
+    showToast("Failed to relabel sample", true);
+  }
 }
 
 function toggleSampleSelection(sampleId, isSelected) {

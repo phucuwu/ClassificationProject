@@ -123,6 +123,7 @@ def get_candidate_class_weights(y_train: np.ndarray) -> list[tuple[str, Any]]:
 def train_taste_classifier(
     X: np.ndarray,
     y: np.ndarray,
+    sample_ids: list[int] | None = None,
     target_recall: float | None = None,
     threshold: float | None = None,
     min_recall_floor: float = 0.70,
@@ -142,6 +143,7 @@ def train_taste_classifier(
     Args:
         X: Feature matrix of shape (N, 768).
         y: Label vector of shape (N,) with binary integers (0 or 1).
+        sample_ids: Optional parallel list of integer sample IDs.
         target_recall: Optional target recall rate for decision threshold calibration.
         threshold: Optional explicit decision threshold. If specified, overrides calibration.
         min_recall_floor: Minimum recall floor used for hybrid F2 threshold calibration (default 0.70).
@@ -174,34 +176,37 @@ def train_taste_classifier(
     use_holdout = False
     holdout_metrics: dict[str, Any] | None = None
     generalization_warning = False
+    dev_ids: list[int] | None = None
 
     if holdout_ratio > 0.0 and sample_count >= 5 and positive_count >= 2 and negative_count >= 2:
         try:
             test_size = float(np.clip(holdout_ratio, 0.05, 0.40))
-            X_dev_split, X_holdout_split, y_dev_split, y_holdout_split = train_test_split(
-                X,
-                y,
+            indices = np.arange(sample_count)
+            dev_idx, holdout_idx = train_test_split(
+                indices,
                 test_size=test_size,
                 stratify=y,
                 random_state=42,
             )
             if (
-                np.sum(y_dev_split == 1) >= 1
-                and np.sum(y_dev_split == 0) >= 1
-                and np.sum(y_holdout_split == 1) >= 1
-                and np.sum(y_holdout_split == 0) >= 1
+                np.sum(y[dev_idx] == 1) >= 1
+                and np.sum(y[dev_idx] == 0) >= 1
+                and np.sum(y[holdout_idx] == 1) >= 1
+                and np.sum(y[holdout_idx] == 0) >= 1
             ):
                 use_holdout = True
-                X_dev = X_dev_split
-                y_dev = y_dev_split
-                X_holdout = X_holdout_split
-                y_holdout = y_holdout_split
+                X_dev = X[dev_idx]
+                y_dev = y[dev_idx]
+                dev_ids = [sample_ids[i] for i in dev_idx] if sample_ids else None
+                X_holdout = X[holdout_idx]
+                y_holdout = y[holdout_idx]
         except Exception:
             use_holdout = False
 
     if not use_holdout:
         X_dev = X
         y_dev = y
+        dev_ids = sample_ids
         X_holdout = None
         y_holdout = None
 
@@ -494,6 +499,31 @@ def train_taste_classifier(
         "baselines": baselines,
     }
 
+    # Map out-of-fold scores to development partition sample IDs if provided
+    oof_score_map: dict[int, float] = {}
+    if dev_ids is not None and len(dev_ids) == len(oof_probabilities):
+        for i, s_id in enumerate(dev_ids):
+            oof_score_map[s_id] = float(oof_probabilities[i])
+
+    # Compute outlier statistics on positive samples
+    outlier_analysis = detect_positive_outliers(
+        X,
+        y,
+        sample_ids=sample_ids,
+        oof_score_map=oof_score_map,
+        model_data={"classifier": final_classifier},
+    )
+    flagged_outliers_count = sum(1 for v in outlier_analysis.values() if v.get("is_outlier"))
+    mean_cent_dist = 0.0
+    if outlier_analysis:
+        mean_cent_dist = round(float(np.mean([v["centroid_distance"] for v in outlier_analysis.values()])), 4)
+
+    metrics["outliers"] = {
+        "flagged_count": flagged_outliers_count,
+        "positive_count": positive_count,
+        "mean_centroid_distance": mean_cent_dist,
+    }
+
     # Save model artifact
     model_payload = {
         "classifier": final_classifier,
@@ -504,6 +534,7 @@ def train_taste_classifier(
         "negative_count": negative_count,
         "oof_probabilities": oof_probabilities.tolist(),
         "y_oof": y_dev.tolist(),
+        "oof_score_map": oof_score_map,
         "reference_embedding": v_ref.tolist(),
         "reference_type": ref_type,
         "reference_source": ref_source,
@@ -669,3 +700,232 @@ def predict_taste(
         "threshold": round(active_threshold, 2),
         "model_loaded": True,
     }
+
+
+def detect_positive_outliers(
+    X: np.ndarray,
+    y: np.ndarray,
+    sample_ids: list[int] | None = None,
+    oof_score_map: dict[int, float] | None = None,
+    model_data: dict[str, Any] | None = None,
+    model_path: Path | str | None = None,
+) -> dict[int, dict[str, Any]]:
+    """Detect inconsistent positive class ratings (outliers) in the dataset.
+
+    Computes cosine distance from each positive sample vision embedding to the
+    positive class centroid. Flags positive samples with distances greater than
+    2 standard deviations above the mean (distance > mean + 2 * std) OR prediction
+    scores below 0.20 (using out-of-fold cross-validation scores when available,
+    falling back to fitted model inference score).
+
+    Args:
+        X: Feature matrix of shape (N, 768).
+        y: Label vector of shape (N,) with integers 1 (Like) or 0 (Dislike).
+        sample_ids: Parallel list of integer sample IDs. If None, uses integer indices 0..N-1.
+        oof_score_map: Optional mapping of sample_id to out-of-fold probability score.
+        model_data: Optional pre-loaded classifier dictionary.
+        model_path: Optional path to serialized model file.
+
+    Returns:
+        Dictionary mapping positive sample_id to:
+        {
+            "is_outlier": bool,
+            "outlier_reason": "distance" | "low_score" | "both" | None,
+            "centroid_distance": float,
+            "prediction_score": float | None,
+            "distance_threshold": float,
+            "score_threshold": 0.20,
+        }
+    """
+    if len(y) == 0:
+        return {}
+
+    ids = sample_ids if sample_ids is not None else list(range(len(y)))
+    pos_mask = (y == 1)
+    pos_indices = np.where(pos_mask)[0]
+
+    if len(pos_indices) == 0:
+        return {}
+
+    X_pos = X[pos_indices]
+
+    # Calculate L2-normalized positive class centroid
+    centroid = np.mean(X_pos, axis=0)
+    centroid_norm = np.linalg.norm(centroid)
+    if centroid_norm > 0:
+        centroid = centroid / centroid_norm
+
+    # Cosine distance = 1 - cosine similarity
+    cos_sims = X_pos @ centroid
+    cos_dists = np.clip(1.0 - cos_sims, 0.0, 2.0)
+
+    mean_dist = float(np.mean(cos_dists))
+    std_dist = float(np.std(cos_dists))
+    dist_threshold = float(mean_dist + 2.0 * std_dist)
+
+    # Load model if needed for fallback prediction scores
+    active_model = model_data if model_data is not None else load_classifier(model_path)
+    classifier = active_model.get("classifier") if active_model else None
+
+    cached_oof_map = oof_score_map or {}
+    if not cached_oof_map and active_model and "oof_score_map" in active_model:
+        cached_oof_map = active_model["oof_score_map"]
+
+    results: dict[int, dict[str, Any]] = {}
+
+    for idx_in_pos, global_idx in enumerate(pos_indices):
+        s_id = ids[global_idx]
+        d_val = float(cos_dists[idx_in_pos])
+
+        # Obtain prediction score: prefer OOF score, fallback to model score
+        pred_score: float | None = None
+        if s_id in cached_oof_map:
+            pred_score = float(cached_oof_map[s_id])
+        elif classifier is not None:
+            emb_vec = X_pos[idx_in_pos].reshape(1, -1)
+            try:
+                pred_score = float(classifier.predict_proba(emb_vec)[0, 1])
+            except Exception:
+                pred_score = None
+
+        # Outlier conditions: dist > mean + 2*std OR score < 0.20
+        dist_flag = bool(len(pos_indices) >= 3 and d_val > dist_threshold)
+        score_flag = bool(pred_score is not None and pred_score < 0.20)
+
+        is_outlier = dist_flag or score_flag
+        reason: str | None = None
+        if dist_flag and score_flag:
+            reason = "both"
+        elif dist_flag:
+            reason = "distance"
+        elif score_flag:
+            reason = "low_score"
+
+        results[s_id] = {
+            "is_outlier": is_outlier,
+            "outlier_reason": reason,
+            "outlier_type": "like",
+            "centroid_distance": round(d_val, 4),
+            "prediction_score": round(pred_score, 4) if pred_score is not None else None,
+            "distance_threshold": round(dist_threshold, 4),
+            "score_threshold": 0.20,
+        }
+
+    return results
+
+
+def detect_negative_outliers(
+    X: np.ndarray,
+    y: np.ndarray,
+    sample_ids: list[int] | None = None,
+    oof_score_map: dict[int, float] | None = None,
+    model_data: dict[str, Any] | None = None,
+    model_path: Path | str | None = None,
+    score_threshold: float | None = None,
+) -> dict[int, dict[str, Any]]:
+    """Detect inconsistent negative class ratings (dislike outliers) in the dataset.
+
+    Computes cosine distance from each negative sample vision embedding to the
+    negative class centroid. Flags negative samples with distances greater than
+    2 standard deviations above the mean (distance > mean + 2 * std) OR prediction
+    scores >= score_threshold (defaulting to the active decision threshold, minimum 0.35).
+
+    Args:
+        X: Feature matrix of shape (N, 768).
+        y: Label vector of shape (N,) with integers 1 (Like) or 0 (Dislike).
+        sample_ids: Parallel list of integer sample IDs. If None, uses integer indices 0..N-1.
+        oof_score_map: Optional mapping of sample_id to out-of-fold probability score.
+        model_data: Optional pre-loaded classifier dictionary.
+        model_path: Optional path to serialized model file.
+        score_threshold: Optional threshold above which a dislike is flagged as inconsistent.
+
+    Returns:
+        Dictionary mapping negative sample_id to:
+        {
+            "is_outlier": bool,
+            "outlier_reason": "distance" | "high_score" | "both" | None,
+            "outlier_type": "dislike",
+            "centroid_distance": float,
+            "prediction_score": float | None,
+            "distance_threshold": float,
+            "score_threshold": float,
+        }
+    """
+    if len(y) == 0:
+        return {}
+
+    ids = sample_ids if sample_ids is not None else list(range(len(y)))
+    neg_mask = (y == 0)
+    neg_indices = np.where(neg_mask)[0]
+
+    if len(neg_indices) == 0:
+        return {}
+
+    X_neg = X[neg_indices]
+
+    # Calculate L2-normalized negative class centroid
+    centroid = np.mean(X_neg, axis=0)
+    centroid_norm = np.linalg.norm(centroid)
+    if centroid_norm > 0:
+        centroid = centroid / centroid_norm
+
+    # Cosine distance = 1 - cosine similarity
+    cos_sims = X_neg @ centroid
+    cos_dists = np.clip(1.0 - cos_sims, 0.0, 2.0)
+
+    mean_dist = float(np.mean(cos_dists))
+    std_dist = float(np.std(cos_dists))
+    dist_threshold = float(mean_dist + 2.0 * std_dist)
+
+    # Load model if needed for fallback prediction scores
+    active_model = model_data if model_data is not None else load_classifier(model_path)
+    classifier = active_model.get("classifier") if active_model else None
+
+    # Use active decision threshold (floor of 0.35 for dislike conflict detection)
+    model_thresh = float(active_model.get("decision_threshold", DEFAULT_DECISION_THRESHOLD)) if active_model else DEFAULT_DECISION_THRESHOLD
+    active_score_threshold = score_threshold if score_threshold is not None else max(model_thresh, 0.35)
+
+    cached_oof_map = oof_score_map or {}
+    if not cached_oof_map and active_model and "oof_score_map" in active_model:
+        cached_oof_map = active_model["oof_score_map"]
+
+    results: dict[int, dict[str, Any]] = {}
+
+    for idx_in_neg, global_idx in enumerate(neg_indices):
+        s_id = ids[global_idx]
+        d_val = float(cos_dists[idx_in_neg])
+
+        pred_score: float | None = None
+        if s_id in cached_oof_map:
+            pred_score = float(cached_oof_map[s_id])
+        elif classifier is not None:
+            emb_vec = X_neg[idx_in_neg].reshape(1, -1)
+            try:
+                pred_score = float(classifier.predict_proba(emb_vec)[0, 1])
+            except Exception:
+                pred_score = None
+
+        dist_flag = bool(len(neg_indices) >= 3 and d_val > dist_threshold)
+        score_flag = bool(pred_score is not None and pred_score >= active_score_threshold)
+
+        is_outlier = dist_flag or score_flag
+        reason: str | None = None
+        if dist_flag and score_flag:
+            reason = "both"
+        elif dist_flag:
+            reason = "distance"
+        elif score_flag:
+            reason = "high_score"
+
+        results[s_id] = {
+            "is_outlier": is_outlier,
+            "outlier_reason": reason,
+            "outlier_type": "dislike",
+            "centroid_distance": round(d_val, 4),
+            "prediction_score": round(pred_score, 4) if pred_score is not None else None,
+            "distance_threshold": round(dist_threshold, 4),
+            "score_threshold": round(active_score_threshold, 4),
+        }
+
+    return results
+

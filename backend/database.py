@@ -136,6 +136,7 @@ def get_samples(
     mode: str | None = None,
     reviewed: int | None = None,
     label: int | None = None,
+    sample_ids: list[int] | None = None,
     limit: int = 50,
     offset: int = 0,
     db_path: Path | str | None = None,
@@ -146,6 +147,12 @@ def get_samples(
         conditions: list[str] = []
         params: list[Any] = []
 
+        if sample_ids is not None:
+            if not sample_ids:
+                return []
+            placeholders = ",".join("?" for _ in sample_ids)
+            conditions.append(f"id IN ({placeholders})")
+            params.extend(sample_ids)
         if mode is not None:
             conditions.append("mode = ?")
             params.append(mode)
@@ -263,18 +270,24 @@ def delete_samples(
 
 def load_training_matrix(
     db_path: Path | str | None = None,
-) -> tuple[np.ndarray, np.ndarray]:
+    return_ids: bool = False,
+) -> tuple[np.ndarray, np.ndarray] | tuple[np.ndarray, np.ndarray, list[int]]:
     """Extract feature matrix (X) and label vector (y) from labeled samples.
+
+    Args:
+        db_path: Optional path to SQLite database file.
+        return_ids: If True, also returns list of integer sample IDs.
 
     Returns:
         X: 2D NumPy array of shape (N, 768) with float32 embeddings.
         y: 1D NumPy array of shape (N,) with integer labels (0 or 1).
+        (Optional) sample_ids: List of integer sample IDs when return_ids=True.
     """
     conn = get_db_connection(db_path)
     try:
         cursor = conn.execute(
             """
-            SELECT embedding, label
+            SELECT id, embedding, label
             FROM samples
             WHERE label IS NOT NULL
             ORDER BY id ASC;
@@ -282,13 +295,18 @@ def load_training_matrix(
         )
         rows = cursor.fetchall()
         if not rows:
-            return np.empty((0, 768), dtype=np.float32), np.empty((0,), dtype=np.int32)
+            empty_X = np.empty((0, 768), dtype=np.float32)
+            empty_y = np.empty((0,), dtype=np.int32)
+            return (empty_X, empty_y, []) if return_ids else (empty_X, empty_y)
 
+        sample_ids = [int(row["id"]) for row in rows]
         embeddings_list = [np.frombuffer(row["embedding"], dtype=np.float32) for row in rows]
         labels_list = [int(row["label"]) for row in rows]
 
         X = np.vstack(embeddings_list).astype(np.float32)
         y = np.array(labels_list, dtype=np.int32)
+        if return_ids:
+            return X, y, sample_ids
         return X, y
     finally:
         conn.close()
@@ -394,4 +412,99 @@ def load_embedding_scatter_data(
         return metadata_list, X
     finally:
         conn.close()
+
+
+def find_near_duplicate(
+    embedding: np.ndarray,
+    threshold: float = 0.98,
+    db_path: Path | str | None = None,
+) -> dict[str, Any] | None:
+    """Find an existing sample in the dataset database with cosine similarity >= threshold.
+
+    Args:
+        embedding: 768-dimensional float32 vision embedding.
+        threshold: Cosine similarity threshold (default 0.98).
+        db_path: Optional path to SQLite database file.
+
+    Returns:
+        Dictionary with id, similarity, image_hash, file_path, label, reviewed if found, else None.
+    """
+    metadata, X = load_embedding_scatter_data(db_path=db_path)
+    if len(X) == 0:
+        return None
+
+    v = np.asarray(embedding, dtype=np.float32).reshape(-1)
+    norm = np.linalg.norm(v)
+    if norm > 0:
+        v = v / norm
+
+    similarities = X @ v
+    max_idx = int(np.argmax(similarities))
+    max_sim = float(similarities[max_idx])
+
+    if max_sim >= threshold:
+        matched = metadata[max_idx]
+        return {
+            "id": matched["id"],
+            "similarity": round(max_sim, 4),
+            "image_hash": matched["image_hash"],
+            "file_path": matched["file_path"],
+            "label": matched["label"],
+            "reviewed": matched["reviewed"],
+        }
+    return None
+
+
+def update_sample_record(
+    sample_id: int,
+    label: int | None = None,
+    mode: str | None = None,
+    prediction_score: float | None = None,
+    reviewed: int | None = None,
+    db_path: Path | str | None = None,
+) -> bool:
+    """Update metadata for an existing sample record.
+
+    Args:
+        sample_id: Sample integer database ID.
+        label: Optional updated label (1, 0, or None).
+        mode: Optional updated mode ('manual', 'supervised', 'auto').
+        prediction_score: Optional model prediction score.
+        reviewed: Optional reviewed flag (1 or 0).
+        db_path: Optional path to SQLite database file.
+
+    Returns:
+        True if the row was updated, False otherwise.
+    """
+    updates: list[str] = []
+    params: list[Any] = []
+
+    if label is not None:
+        updates.append("label = ?")
+        params.append(label)
+    if mode is not None:
+        updates.append("mode = ?")
+        params.append(mode)
+    if prediction_score is not None:
+        updates.append("prediction_score = ?")
+        params.append(prediction_score)
+    if reviewed is not None:
+        updates.append("reviewed = ?")
+        params.append(reviewed)
+
+    if not updates:
+        return False
+
+    params.append(sample_id)
+    conn = get_db_connection(db_path)
+    try:
+        with conn:
+            cursor = conn.execute(
+                f"UPDATE samples SET {', '.join(updates)} WHERE id = ?;",
+                params,
+            )
+            return cursor.rowcount > 0
+    finally:
+        conn.close()
+
 

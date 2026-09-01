@@ -8,7 +8,7 @@
   <link rel="preconnect" href="https://fonts.googleapis.com">
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
   <link href="https://fonts.googleapis.com/css2?family=Outfit:wght@300;400;500;600;700&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet">
-  <link rel="stylesheet" href="style.css?v=2.1">
+  <link rel="stylesheet" href="style.css?v=2.3">
 </head>
 <body>
   <div id="app" class="dashboard-layout">
@@ -106,7 +106,7 @@
         <div class="panel-toolbar">
           <div class="toolbar-left">
             <h2>Dataset Inspector</h2>
-            <p class="toolbar-help">Browse all ingested samples across manual, supervised, and automated modes.</p>
+            <p class="toolbar-help">Browse all ingested samples. Filter for inconsistent likes (outliers with distance &gt; 2σ or score &lt; 0.20) to inspect and prune inconsistent manual ratings.</p>
           </div>
           <div class="toolbar-right">
             <div class="filter-group">
@@ -124,6 +124,14 @@
                 <option value="">All Labels</option>
                 <option value="1">Likes (1)</option>
                 <option value="0">Dislikes (0)</option>
+              </select>
+            </div>
+            <div class="filter-group">
+              <label for="filter-sample-outlier">Quality:</label>
+              <select id="filter-sample-outlier" class="select-input">
+                <option value="all">All Quality</option>
+                <option value="inconsistent_likes">Inconsistent Likes (Outliers)</option>
+                <option value="inconsistent_dislikes">Inconsistent Dislikes (Outliers)</option>
               </select>
             </div>
             <button id="btn-select-all-samples" class="btn btn-secondary">Select All</button>
@@ -535,6 +543,6 @@
     <div id="toast-container" class="toast-container"></div>
   </div>
 
-  <script src="app.js?v=2.1"></script>
+  <script src="app.js?v=2.3"></script>
 </body>
 </html>
