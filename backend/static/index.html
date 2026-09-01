@@ -275,8 +275,9 @@
               <span class="status-indicator live"></span>
               <span id="hero-status-text">MODEL ONLINE</span>
             </div>
-            <div class="hero-chip">clip-ViT-L-14 + Balanced Logistic Regression</div>
+            <div class="hero-chip" id="hero-model-arch">clip-ViT-L-14 + Logistic Regression</div>
             <div class="hero-chip" id="hero-eval-chip">Stratified 5-Fold OOF CV</div>
+            <div class="hero-chip" id="hero-tuning-chip">Tuning: C=1.0, balanced</div>
           </div>
           <div class="hero-meta-group" id="hero-dataset-meta">
             <!-- Populated dynamically: Total samples, likes ratio -->
@@ -296,6 +297,11 @@
                 <h3>Generalization & Retraining Studio</h3>
                 <p class="subtext">Out-of-fold validation, holdout generalization verification, and calibration controls.</p>
               </div>
+            </div>
+
+            <!-- Evaluation Baselines Benchmark Box -->
+            <div class="baselines-card-section" id="baselines-summary-container">
+              <!-- Dynamically populated evaluation baselines benchmark -->
             </div>
 
             <!-- Holdout Verification Box -->
@@ -336,6 +342,32 @@
                   </div>
                   <div class="holdout-hint-text">
                     Reserves a stratified split to verify generalization on unseen samples before final model refit.
+                  </div>
+                </div>
+
+                <!-- Baseline Reference Settings -->
+                <div class="baseline-setting-group">
+                  <div class="baseline-setting-header">
+                    <label for="input-baseline-prompt">Zero-Shot Reference Baseline:</label>
+                    <button type="button" id="btn-reset-baseline" class="btn-text-action">Reset to Default</button>
+                  </div>
+                  <div class="baseline-input-row">
+                    <input type="text" id="input-baseline-prompt" class="text-input" placeholder="e.g. goth aesthetic alternative indie girl style" value="goth aesthetic alternative indie girl style">
+                  </div>
+                  
+                  <div class="exemplar-upload-row">
+                    <label class="file-upload-btn" id="lbl-upload-exemplar">
+                      <span>🖼️ Upload Exemplar Artwork</span>
+                      <input type="file" id="input-exemplar-image" accept="image/*" class="hidden-file-input">
+                    </label>
+                    <div id="exemplar-preview-container" class="exemplar-preview-box hidden">
+                      <img id="exemplar-preview-img" src="" alt="Exemplar thumbnail">
+                      <span id="exemplar-preview-label">Exemplar Image Loaded</span>
+                      <button type="button" id="btn-clear-exemplar" class="btn-icon-xs" title="Remove exemplar image">✕</button>
+                    </div>
+                  </div>
+                  <div class="baseline-hint-text">
+                    Reference target used for zero-shot cosine similarity benchmark. Provide prompt text or upload an exemplar artwork.
                   </div>
                 </div>
               </div>

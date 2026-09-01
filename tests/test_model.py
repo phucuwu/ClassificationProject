@@ -10,7 +10,10 @@ from PIL import Image
 
 from backend.model import (
     DEFAULT_DECISION_THRESHOLD,
+    DEFAULT_ZERO_SHOT_PROMPT,
     EMBEDDING_DIM,
+    HYPERPARAMETER_C_GRID,
+    extract_text_embedding,
     extract_vision_embedding,
     load_classifier,
     predict_taste,
@@ -225,22 +228,25 @@ def test_holdout_generalization_warning():
     with tempfile.TemporaryDirectory() as tmpdir:
         model_path = Path(tmpdir) / "test_warning_model.pkl"
         np.random.seed(42)
-        # Development set: easy separable likes vs dislikes
-        X_dev_neg = np.random.randn(50, EMBEDDING_DIM).astype(np.float32)
-        X_dev_pos = np.random.randn(10, EMBEDDING_DIM).astype(np.float32) + 2.0
-        X_dev = np.vstack([X_dev_neg, X_dev_pos]).astype(np.float32)
-        y_dev = np.array([0] * 50 + [1] * 10, dtype=np.int32)
+        from sklearn.model_selection import train_test_split as _tts
 
-        # Holdout set (chronological end): completely inverted features so model mispredicts
-        X_h_neg = np.random.randn(10, EMBEDDING_DIM).astype(np.float32) + 2.0
-        X_h_pos = np.random.randn(2, EMBEDDING_DIM).astype(np.float32) - 2.0
-        X_h = np.vstack([X_h_neg, X_h_pos]).astype(np.float32)
-        y_h = np.array([0] * 10 + [1] * 2, dtype=np.int32)
+        n_neg = 60
+        n_pos = 12
+        y = np.array([0] * n_neg + [1] * n_pos, dtype=np.int32)
+        idx = np.arange(len(y))
+        _, h_idx = _tts(idx, test_size=0.166, stratify=y, random_state=42)
 
-        X_total = np.vstack([X_dev, X_h]).astype(np.float32)
-        y_total = np.concatenate([y_dev, y_h])
+        X = np.random.randn(len(y), EMBEDDING_DIM).astype(np.float32)
+        X[y == 1] += 2.0
 
-        res = train_taste_classifier(X_total, y_total, holdout_ratio=0.166, model_path=model_path)
+        # Invert holdout samples so development set is cleanly separable but holdout mispredicts
+        for i in h_idx:
+            if y[i] == 1:
+                X[i] -= 4.0
+            else:
+                X[i] += 4.0
+
+        res = train_taste_classifier(X, y, holdout_ratio=0.166, model_path=model_path)
         assert res["status"] == "trained"
         assert res["metrics"]["generalization_warning"] is True
         assert res["metrics"]["holdout"]["generalization_warning"] is True
@@ -271,6 +277,127 @@ def test_threshold_update_with_cached_oof():
         assert loaded["decision_threshold"] == 0.70
 
 
+def test_hyperparameter_grid_search():
+    """Verify regularized hyperparameter search selects best C and class weighting."""
+    with tempfile.TemporaryDirectory() as tmpdir:
+        model_path = Path(tmpdir) / "test_grid_model.pkl"
+        np.random.seed(42)
+        n_dislikes, n_likes = 80, 15
+        X_neg = np.random.randn(n_dislikes, EMBEDDING_DIM).astype(np.float32)
+        X_pos = np.random.randn(n_likes, EMBEDDING_DIM).astype(np.float32) + 1.0
+        X = np.vstack([X_neg, X_pos]).astype(np.float32)
+        y = np.array([0] * n_dislikes + [1] * n_likes, dtype=np.int32)
+
+        res = train_taste_classifier(X, y, holdout_ratio=0.0, model_path=model_path)
+        assert res["status"] == "trained"
+        m = res["metrics"]
+        assert "best_params" in m
+        assert "tuning_summary" in m
+        best_p = m["best_params"]
+        assert best_p["C"] in HYPERPARAMETER_C_GRID
+        assert best_p["class_weight"] in ["balanced", "unweighted", "balanced_1.5x", "balanced_2.0x"]
+        assert len(m["tuning_summary"]) == len(HYPERPARAMETER_C_GRID) * 4
+
+        # Loaded model preserves best_params and tuning_summary
+        loaded = load_classifier(model_path)
+        assert loaded["metrics"]["best_params"] == best_p
+        assert "tuning_summary" in loaded["metrics"]
+
+
+def test_reference_baselines():
+    """Verify calculation of random guess, positive centroid, and zero-shot baselines."""
+    with tempfile.TemporaryDirectory() as tmpdir:
+        model_path = Path(tmpdir) / "test_baselines_model.pkl"
+        np.random.seed(42)
+        n_dislikes, n_likes = 90, 10
+        X_neg = np.random.randn(n_dislikes, EMBEDDING_DIM).astype(np.float32)
+        X_pos = np.random.randn(n_likes, EMBEDDING_DIM).astype(np.float32) + 1.0
+        X = np.vstack([X_neg, X_pos]).astype(np.float32)
+        y = np.array([0] * n_dislikes + [1] * n_likes, dtype=np.int32)
+
+        res = train_taste_classifier(X, y, holdout_ratio=0.0, model_path=model_path)
+        assert res["status"] == "trained"
+        assert "baselines" in res["metrics"]
+        b = res["metrics"]["baselines"]
+        assert "random_guess" in b
+        assert "positive_centroid" in b
+        assert "zero_shot" in b
+        assert b["reference_type"] == "text"
+        assert b["reference_source"] == DEFAULT_ZERO_SHOT_PROMPT
+
+        # Random guess baseline matches positive prevalence (10/100 = 0.10)
+        expected_prev = round(10 / 100, 4)
+        assert abs(b["random_guess"] - expected_prev) < 0.01
+
+        # Centroid and zero-shot baselines return valid PR-AUC floats
+        assert 0.0 <= b["positive_centroid"] <= 1.0
+        assert 0.0 <= b["zero_shot"] <= 1.0
+
+
+def test_baseline_customization_and_persistence():
+    """Verify custom prompt, exemplar image override, and baseline persistence across runs."""
+    with tempfile.TemporaryDirectory() as tmpdir:
+        model_path = Path(tmpdir) / "test_custom_baseline_model.pkl"
+        np.random.seed(42)
+        n_dislikes, n_likes = 50, 10
+        X_neg = np.random.randn(n_dislikes, EMBEDDING_DIM).astype(np.float32)
+        X_pos = np.random.randn(n_likes, EMBEDDING_DIM).astype(np.float32) + 0.8
+        X = np.vstack([X_neg, X_pos]).astype(np.float32)
+        y = np.array([0] * n_dislikes + [1] * n_likes, dtype=np.int32)
+
+        # 1. Custom text prompt
+        custom_prompt = "cyberpunk neon anime illustration"
+        res1 = train_taste_classifier(
+            X, y,
+            baseline_prompt_text=custom_prompt,
+            holdout_ratio=0.0,
+            model_path=model_path,
+        )
+        assert res1["status"] == "trained"
+        b1 = res1["metrics"]["baselines"]
+        assert b1["reference_type"] == "text"
+        assert b1["reference_source"] == custom_prompt
+
+        # 2. Exemplar image upload override
+        test_img = Image.new("RGB", (64, 64), color=(200, 50, 80))
+        buf = io.BytesIO()
+        test_img.save(buf, format="JPEG")
+        img_b64 = "data:image/jpeg;base64," + base64.b64encode(buf.getvalue()).decode("utf-8")
+
+        res2 = train_taste_classifier(
+            X, y,
+            baseline_image_base64=img_b64,
+            holdout_ratio=0.0,
+            model_path=model_path,
+        )
+        assert res2["status"] == "trained"
+        b2 = res2["metrics"]["baselines"]
+        assert b2["reference_type"] == "image"
+        assert b2["reference_source"] == "exemplar_image"
+
+        # 3. Persistence: subsequent retrain without overrides keeps exemplar image
+        res3 = train_taste_classifier(
+            X, y,
+            holdout_ratio=0.0,
+            model_path=model_path,
+        )
+        assert res3["status"] == "trained"
+        b3 = res3["metrics"]["baselines"]
+        assert b3["reference_type"] == "image"
+
+        # 4. Reset baseline to default
+        res4 = train_taste_classifier(
+            X, y,
+            reset_baseline_to_default=True,
+            holdout_ratio=0.0,
+            model_path=model_path,
+        )
+        assert res4["status"] == "trained"
+        b4 = res4["metrics"]["baselines"]
+        assert b4["reference_type"] == "text"
+        assert b4["reference_source"] == DEFAULT_ZERO_SHOT_PROMPT
+
+
 if __name__ == "__main__":
     print("Testing cold start and edge cases...")
     test_cold_start_and_insufficient_data()
@@ -286,6 +413,12 @@ if __name__ == "__main__":
     test_holdout_generalization_warning()
     print("Testing threshold updates with cached out-of-fold predictions...")
     test_threshold_update_with_cached_oof()
+    print("Testing hyperparameter grid search...")
+    test_hyperparameter_grid_search()
+    print("Testing reference baselines...")
+    test_reference_baselines()
+    print("Testing baseline customization and persistence...")
+    test_baseline_customization_and_persistence()
     print("Testing CLIP feature extraction...")
     test_feature_extraction()
-    print("ALL CHECKPOINT 6 MODEL TESTS PASSED SUCCESSFULLY!")
+    print("ALL CHECKPOINT 7 MODEL TESTS PASSED SUCCESSFULLY!")
