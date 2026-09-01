@@ -44,5 +44,9 @@ This glossary defines standard terminology used across the backend, userscript, 
 * **Backend server**: The local Python FastAPI service running at `http://localhost:8000`. Handles image capture, embedding extraction, model training, prediction inference, and database queries.
 * **Userscript**: The client-side Tampermonkey JavaScript injected into the library website. Captures images, renders interface badges, dispatches keyboard events, and communicates with the backend server via HTTP requests.
 * **Review queue**: The dashboard table view and review interface where unreviewed automated decisions (`reviewed = 0`) are displayed for human confirmation or relabeling.
-* **Developer dashboard**: The web UI served by the backend at `http://localhost:8000` for dataset inspection, batch review, decision threshold tuning, and model retraining.
+* **Developer dashboard**: The web UI served by the backend at `http://localhost:8000` for dataset inspection, batch review, decision threshold tuning, model retraining, and embedding space visualization.
+* **Embedding space visualizer**: An interactive 2D scatter plot view in the developer dashboard for exploring the distribution and clustering of vision embeddings.
 * **Dataset database**: The local SQLite database file at `data/dataset.db` running in WAL mode, storing sample metadata, binary labels, prediction scores, and embedding BLOBs.
+* **PCA (Principal Component Analysis)**: A linear dimensionality reduction technique that projects 768-dimensional vision embeddings onto the 2 orthogonal axes of highest variance while preserving global dataset structure.
+* **t-SNE (t-Distributed Stochastic Neighbor Embedding)**: A non-linear manifold learning technique that projects 768-dimensional vision embeddings into 2D coordinates while preserving local neighborhood similarities and revealing aesthetic sub-clusters.
+

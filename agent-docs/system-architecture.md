@@ -128,4 +128,62 @@ The system consists of two primary components:
 A clean local web interface served directly by FastAPI at `http://localhost:8000`:
 * **Overview Tab:** Summary cards (Total samples, Total Likes, Like Ratio, Model Status, Current PR-AUC).
 * **Review Queue Tab:** Grid view of unreviewed full-auto predictions. Review with mouse clicks to toggle badges or `1`/`0` keys on selected cards.
+* **Samples Tab:** Dataset inspector to browse, filter, and batch delete samples.
+* **Embedding Space Tab:** Interactive 2D scatter plot visualizer projecting the vision embedding space using PCA or t-SNE, with color coding by label or score and hover image previews.
 * **Model & Metrics Tab:** PR curve visualization, threshold slider showing dynamic Recall/Precision tradeoff, confusion matrix, and a "Retrain Model" button.
+* **Console Tab:** Real-time log stream of system and rating events.
+
+---
+
+## 6. Embedding Space Visualizer & Dimensionality Reduction
+
+The developer dashboard includes an interactive 2D scatter plot to explore the 768-dimensional vision embedding space.
+
+```
++-------------------------------------------------------------------------------+
+|                      Embedding Space Visualizer Architecture                  |
+|                                                                               |
+|   +-----------------------------------------------------------------------+   |
+|   | SQLite DB (`samples` table)                                            |   |
+|   |  - 768-dim L2-normalized float32 BLOBs + Sample Metadata              |   |
+|   +-----------------------------------+-----------------------------------+   |
+|                                       | load_embedding_scatter_data()         |
+|                                       v                                       |
+|   +-----------------------------------------------------------------------+   |
+|   | Backend API: GET /api/embeddings/scatter?method={pca|tsne}            |   |
+|   |                                                                       |   |
+|   |   +-----------------------------------+---------------------------+   |   |
+|   |   | PCA (Linear Projection)           | t-SNE (Non-Linear)        |   |   |
+|   |   | - sklearn.decomposition.PCA       | - sklearn.manifold.TSNE   |   |   |
+|   |   | - Maximize global variance        | - Preserves local clusters|   |   |
+|   |   | - Returns explained variance ratio| - Iterative probability fit|  |   |
+|   |   +-----------------------------------+---------------------------+   |   |
+|   +-----------------------------------+-----------------------------------+   |
+|                                       | JSON [{x, y, label, score, ...}]      |
+|                                       v                                       |
+|   +-----------------------------------------------------------------------+   |
+|   | HTML5 Canvas Visualizer (Frontend)                                    |   |
+|   |  - HiDPI hardware-accelerated rendering                               |   |
+|   |  - Interactive pan (drag) and cursor-centered zoom (mouse wheel)       |   |
+|   |  - Point coloring: By Label (1=Emerald, 0=Rose) or Prediction Score   |   |
+|   |  - Hover Card: Artwork thumbnail preview loaded via /images/{hash}.jpg|   |
+|   |  - Side Inspector: Sample details with one-click relabel & delete     |   |
+|   +-----------------------------------------------------------------------+   |
++-------------------------------------------------------------------------------+
+```
+
+### Dimensionality Reduction Algorithms
+
+#### 1. PCA (Principal Component Analysis)
+* **Mathematical approach**: Linear orthogonal projection. Finds the two eigenvectors of the sample covariance matrix corresponding to the largest eigenvalues.
+* **Preservation**: Preserves **global variance and broad distance relationships**. Distant clusters in 768D stay distant in 2D.
+* **Deterministic**: Fixed computation with zero randomness.
+* **Explained variance**: The endpoint returns `variance_ratio = [PC1, PC2]`, indicating the proportion of total information preserved in the 2D view.
+* **Use case**: Assessing overall dataset balance and viewing the feature space through the lens of linear classifiers like Logistic Regression.
+
+#### 2. t-SNE (t-Distributed Stochastic Neighbor Embedding)
+* **Mathematical approach**: Non-linear manifold learning. Converts pairwise Euclidean distances into conditional probabilities in high-dimensional space and Student-t distributions in 2D space, minimizing the Kullback-Leibler (KL) divergence via gradient descent.
+* **Preservation**: Preserves **local neighborhoods**. Artworks with similar visual semantics, color palettes, or artistic styles cluster tightly together.
+* **Dynamic perplexity**: Automatically tuned based on sample count: $\text{perplexity} = \max(1, \min(30, \lfloor(N - 1) / 3\rfloor))$.
+* **Use case**: Discovering fine-grained aesthetic sub-clusters (e.g. watercolor, anime portraits, dark landscapes) within your liked artworks.
+

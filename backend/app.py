@@ -28,9 +28,12 @@ from backend.database import (
     init_db,
     insert_sample,
     load_training_matrix,
+    load_embedding_scatter_data,
     update_sample_reviews,
     delete_samples,
 )
+from sklearn.decomposition import PCA
+from sklearn.manifold import TSNE
 from backend.model import (
     DEFAULT_DECISION_THRESHOLD,
     extract_vision_embedding,
@@ -542,6 +545,101 @@ def get_metrics() -> dict[str, Any]:
         ) from exc
 
 
+@app.get("/api/embeddings/scatter")
+def get_embeddings_scatter(
+    method: str = Query("pca", pattern="^(pca|tsne)$", description="Reduction method: 'pca' or 'tsne'."),
+) -> dict[str, Any]:
+    """Extract 2D coordinates for dataset sample embeddings using PCA or t-SNE."""
+    try:
+        metadata, X = load_embedding_scatter_data()
+        total_points = len(metadata)
+
+        if total_points == 0:
+            return {
+                "status": "empty",
+                "total_points": 0,
+                "method": method,
+                "variance_ratio": None,
+                "points": [],
+            }
+
+        if total_points == 1:
+            meta = metadata[0]
+            return {
+                "status": "success",
+                "total_points": 1,
+                "method": method,
+                "variance_ratio": [1.0, 0.0] if method == "pca" else None,
+                "points": [
+                    {
+                        "id": meta["id"],
+                        "image_hash": meta["image_hash"],
+                        "image_url": f"/images/{meta['image_hash']}.jpg",
+                        "label": meta["label"],
+                        "prediction_score": meta["prediction_score"],
+                        "mode": meta["mode"],
+                        "reviewed": meta["reviewed"],
+                        "created_at": meta["created_at"],
+                        "x": 0.0,
+                        "y": 0.0,
+                    }
+                ],
+            }
+
+        variance_ratio = None
+        if method == "pca":
+            pca = PCA(n_components=2)
+            coords = pca.fit_transform(X)
+            variance_ratio = [round(float(v), 4) for v in pca.explained_variance_ratio_]
+        else:
+            # t-SNE requires perplexity < n_samples
+            max_perp = max(1, min(30, (total_points - 1) // 3))
+            tsne = TSNE(
+                n_components=2,
+                perplexity=max_perp,
+                random_state=42,
+                init="pca" if total_points >= 4 else "random",
+                learning_rate="auto",
+            )
+            coords = tsne.fit_transform(X)
+
+        points: list[dict[str, Any]] = []
+        for i, meta in enumerate(metadata):
+            points.append(
+                {
+                    "id": meta["id"],
+                    "image_hash": meta["image_hash"],
+                    "image_url": f"/images/{meta['image_hash']}.jpg",
+                    "label": meta["label"],
+                    "prediction_score": meta["prediction_score"],
+                    "mode": meta["mode"],
+                    "reviewed": meta["reviewed"],
+                    "created_at": meta["created_at"],
+                    "x": round(float(coords[i, 0]), 4),
+                    "y": round(float(coords[i, 1]), 4),
+                }
+            )
+
+        return {
+            "status": "success",
+            "total_points": total_points,
+            "method": method,
+            "variance_ratio": variance_ratio,
+            "points": points,
+        }
+    except Exception as exc:
+        add_activity_log("ERROR", "scatter_projection_failed", f"Failed to project embeddings: {str(exc)}")
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Failed to generate embedding projection: {str(exc)}",
+        ) from exc
+
+
+# Mount image store if directory exists
+if IMAGES_DIR.exists():
+    app.mount("/images", StaticFiles(directory=str(IMAGES_DIR)), name="images")
+
 # Mount static directory for developer dashboard if it exists
 if STATIC_DIR.exists():
     app.mount("/", StaticFiles(directory=str(STATIC_DIR), html=True), name="static")
+
