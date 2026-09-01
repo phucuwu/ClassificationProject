@@ -104,30 +104,92 @@ function initEventListeners() {
 
   // Threshold Slider
   const thresholdSlider = document.getElementById("slider-threshold");
-  let thresholdDebounceTimer = null;
   if (thresholdSlider) {
+    // Update numerical value display in real-time while dragging without sending API requests
     thresholdSlider.addEventListener("input", (e) => {
       const val = parseFloat(e.target.value).toFixed(2);
       document.getElementById("display-threshold-val").textContent = val;
+    });
 
-      if (thresholdDebounceTimer) clearTimeout(thresholdDebounceTimer);
-      thresholdDebounceTimer = setTimeout(async () => {
-        try {
-          const res = await fetch("/api/threshold", {
-            method: "POST",
-            headers: { "Content-Type": "application/json" },
-            body: JSON.stringify({ threshold: parseFloat(val) }),
-          });
-          if (!res.ok) throw new Error("Failed to update threshold");
-          const data = await res.json();
-          if (data.metrics) {
-            updateMetricsDisplay(data.metrics);
-          }
-          showToast(`Active threshold updated to θ=${val}`);
-        } catch (err) {
-          console.error("Error updating threshold:", err);
+    // Only dispatch network request to /api/threshold once the user has stopped dragging
+    thresholdSlider.addEventListener("change", async (e) => {
+      const val = parseFloat(e.target.value).toFixed(2);
+      try {
+        const res = await fetch("/api/threshold", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ threshold: parseFloat(val) }),
+        });
+        if (!res.ok) throw new Error("Failed to update threshold");
+        const data = await res.json();
+        if (data.metrics) {
+          updateMetricsDisplay(data.metrics);
         }
-      }, 250);
+        showToast(`Active threshold updated to θ=${val}`);
+      } catch (err) {
+        console.error("Error updating threshold:", err);
+      }
+    });
+  }
+
+  // Quick Threshold Preset Chips
+  document.querySelectorAll(".preset-chip").forEach((btn) => {
+    btn.addEventListener("click", async () => {
+      const val = parseFloat(btn.dataset.val);
+      const slider = document.getElementById("slider-threshold");
+      if (slider) slider.value = val.toFixed(2);
+      document.getElementById("display-threshold-val").textContent = val.toFixed(2);
+      try {
+        const res = await fetch("/api/threshold", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ threshold: val }),
+        });
+        if (!res.ok) throw new Error("Failed to update threshold");
+        const data = await res.json();
+        if (data.metrics) {
+          updateMetricsDisplay(data.metrics);
+        }
+        showToast(`Active threshold preset set to θ=${val.toFixed(2)}`);
+      } catch (err) {
+        console.error("Error updating threshold:", err);
+      }
+    });
+  });
+
+  // Holdout Ratio Slider Listener
+  const holdoutSlider = document.getElementById("input-holdout-ratio");
+  if (holdoutSlider) {
+    holdoutSlider.addEventListener("input", (e) => {
+      const pct = Math.round(parseFloat(e.target.value) * 100);
+      document.getElementById("display-holdout-val").textContent = `${pct}%`;
+    });
+  }
+
+  // Calibration Strategy Selector
+  const stratSelect = document.getElementById("select-calibration-strategy");
+  const recallParamGroup = document.getElementById("group-recall-floor");
+  const recallParamLbl = document.getElementById("lbl-recall-param");
+  const recallParamInput = document.getElementById("input-recall-floor");
+
+  if (stratSelect && recallParamGroup && recallParamLbl && recallParamInput) {
+    stratSelect.addEventListener("change", () => {
+      const strat = stratSelect.value;
+      if (strat === "hybrid") {
+        recallParamGroup.style.display = "block";
+        recallParamLbl.textContent = "Recall Floor (0.70):";
+        recallParamInput.value = "0.70";
+        recallParamInput.min = "0.50";
+        recallParamInput.max = "0.95";
+      } else if (strat === "target_recall") {
+        recallParamGroup.style.display = "block";
+        recallParamLbl.textContent = "Target Recall Quota (0.90):";
+        recallParamInput.value = "0.90";
+        recallParamInput.min = "0.50";
+        recallParamInput.max = "0.99";
+      } else {
+        recallParamGroup.style.display = "none";
+      }
     });
   }
 
@@ -605,60 +667,248 @@ async function handleBatchDeleteSamples() {
   }
 }
 
-function updateMetricsDisplay(m) {
-  const metricsDisplay = document.getElementById("model-metrics-display");
-  if (!metricsDisplay || !m) return;
+function updateMetricsDisplay(m, stats = {}) {
+  const kpiGrid = document.getElementById("model-kpi-grid");
+  const holdoutContainer = document.getElementById("holdout-summary-container");
+  if (!m) return;
 
-  metricsDisplay.innerHTML = `
-    <div class="metrics-stat-grid">
-      <div class="stat-box">
-        <div class="box-val">${m.pr_auc || 0}</div>
-        <div class="box-lbl">PR-AUC</div>
-      </div>
-      <div class="stat-box">
-        <div class="box-val" style="color: #10b981;">${((m.recall || 0) * 100).toFixed(0)}%</div>
-        <div class="box-lbl">Recall (Likes Caught)</div>
-      </div>
-      <div class="stat-box">
-        <div class="box-val">${((m.precision || 0) * 100).toFixed(0)}%</div>
-        <div class="box-lbl">Precision</div>
-      </div>
-      <div class="stat-box">
-        <div class="box-val" style="color: #a855f7;">${m.f2_score || 0}</div>
-        <div class="box-lbl">F₂ Score</div>
-      </div>
-    </div>
-  `;
+  const prAuc = m.pr_auc !== undefined ? m.pr_auc.toFixed(3) : "0.000";
+  const avgPrec = m.average_precision !== undefined ? m.average_precision.toFixed(3) : "--";
+  const recallPct = ((m.recall || 0) * 100).toFixed(0);
+  const precisionPct = ((m.precision || 0) * 100).toFixed(0);
+  const f2Score = m.f2_score !== undefined ? m.f2_score.toFixed(3) : "0.000";
 
-  // Update Confusion Matrix cells
-  if (m.confusion_matrix) {
-    const cm = m.confusion_matrix;
-    const tpEl = document.getElementById("cell-tp");
-    const fpEl = document.getElementById("cell-fp");
-    const fnEl = document.getElementById("cell-fn");
-    const tnEl = document.getElementById("cell-tn");
-    if (tpEl) tpEl.textContent = cm.true_positives || 0;
-    if (fpEl) fpEl.textContent = cm.false_positives || 0;
-    if (fnEl) fnEl.textContent = cm.false_negatives || 0;
-    if (tnEl) tnEl.textContent = cm.true_negatives || 0;
+  const cm = m.confusion_matrix || { true_positives: 0, false_positives: 0, true_negatives: 0, false_negatives: 0 };
+  const tp = cm.true_positives || 0;
+  const fp = cm.false_positives || 0;
+  const fn = cm.false_negatives || 0;
+  const tn = cm.true_negatives || 0;
+
+  const totalLikes = tp + fn;
+  const totalDislikes = fp + tn;
+
+  const tpPct = totalLikes > 0 ? ((tp / totalLikes) * 100).toFixed(0) : "0";
+  const fnPct = totalLikes > 0 ? ((fn / totalLikes) * 100).toFixed(0) : "0";
+  const fpPct = totalDislikes > 0 ? ((fp / totalDislikes) * 100).toFixed(0) : "0";
+  const tnPct = totalDislikes > 0 ? ((tn / totalDislikes) * 100).toFixed(0) : "0";
+
+  if (kpiGrid) {
+    kpiGrid.innerHTML = `
+      <!-- KPI 1: PR-AUC -->
+      <div class="kpi-card" style="--kpi-accent: #a855f7;">
+        <div class="kpi-card-header">
+          <span class="kpi-title">PR-AUC Score</span>
+          <span class="kpi-icon">📈</span>
+        </div>
+        <div class="kpi-val">${prAuc}</div>
+        <div class="kpi-sub">Avg Precision: <strong>${avgPrec}</strong></div>
+        <div class="kpi-progress-bar">
+          <div class="kpi-progress-fill" style="width: ${Math.min(100, Math.max(0, m.pr_auc * 100))}%; background: #a855f7;"></div>
+        </div>
+      </div>
+
+      <!-- KPI 2: Recall -->
+      <div class="kpi-card" style="--kpi-accent: #10b981;">
+        <div class="kpi-card-header">
+          <span class="kpi-title">Recall (Likes Caught)</span>
+          <span class="kpi-icon">🎯</span>
+        </div>
+        <div class="kpi-val" style="color: #34d399;">${recallPct}%</div>
+        <div class="kpi-sub">${tp} of ${totalLikes} True Likes caught</div>
+        <div class="kpi-progress-bar">
+          <div class="kpi-progress-fill" style="width: ${recallPct}%; background: #10b981;"></div>
+        </div>
+      </div>
+
+      <!-- KPI 3: Precision -->
+      <div class="kpi-card" style="--kpi-accent: #38bdf8;">
+        <div class="kpi-card-header">
+          <span class="kpi-title">Precision (Signal Rate)</span>
+          <span class="kpi-icon">✨</span>
+        </div>
+        <div class="kpi-val" style="color: #38bdf8;">${precisionPct}%</div>
+        <div class="kpi-sub">${fp} False Positives flagged</div>
+        <div class="kpi-progress-bar">
+          <div class="kpi-progress-fill" style="width: ${precisionPct}%; background: #38bdf8;"></div>
+        </div>
+      </div>
+
+      <!-- KPI 4: F2 Score -->
+      <div class="kpi-card" style="--kpi-accent: #c084fc;">
+        <div class="kpi-card-header">
+          <span class="kpi-title">F₂ Score (Balanced)</span>
+          <span class="kpi-icon">⚖️</span>
+        </div>
+        <div class="kpi-val" style="color: #c084fc;">${f2Score}</div>
+        <div class="kpi-sub">Weights Recall 2× over Precision</div>
+        <div class="kpi-progress-bar">
+          <div class="kpi-progress-fill" style="width: ${Math.min(100, Math.max(0, m.f2_score * 100))}%; background: #c084fc;"></div>
+        </div>
+      </div>
+    `;
+  }
+
+  // Holdout Verification Section
+  if (holdoutContainer) {
+    if (m.holdout) {
+      const h = m.holdout;
+      const isWarn = m.generalization_warning;
+      const badgeHtml = isWarn
+        ? `<span class="holdout-badge warn">⚠ Generalization Drop</span>`
+        : `<span class="holdout-badge pass">✓ Stratified Holdout Verified</span>`;
+
+      holdoutContainer.innerHTML = `
+        <div class="holdout-header">
+          <div class="holdout-title">
+            <span>🛡️ Generalization Holdout Verification</span>
+          </div>
+          ${badgeHtml}
+        </div>
+        <div class="holdout-grid">
+          <div class="holdout-stat">
+            <div class="holdout-stat-val">${h.pr_auc !== undefined ? h.pr_auc.toFixed(3) : '--'}</div>
+            <div class="holdout-stat-lbl">Holdout PR-AUC</div>
+          </div>
+          <div class="holdout-stat">
+            <div class="holdout-stat-val" style="color: #34d399;">${((h.recall || 0) * 100).toFixed(0)}%</div>
+            <div class="holdout-stat-lbl">Holdout Recall</div>
+          </div>
+          <div class="holdout-stat">
+            <div class="holdout-stat-val" style="color: #38bdf8;">${((h.precision || 0) * 100).toFixed(0)}%</div>
+            <div class="holdout-stat-lbl">Holdout Prec.</div>
+          </div>
+          <div class="holdout-stat">
+            <div class="holdout-stat-val" style="color: #c084fc;">${h.f2_score !== undefined ? h.f2_score.toFixed(3) : '--'}</div>
+            <div class="holdout-stat-lbl">Holdout F₂</div>
+          </div>
+        </div>
+        <div class="holdout-footer-text">
+          Evaluated on <strong>${h.sample_count} stratified holdout samples</strong> (${h.positive_count} Likes, ${h.negative_count} Dislikes) before final full-dataset fit.
+        </div>
+      `;
+    } else {
+      holdoutContainer.innerHTML = `
+        <div class="holdout-header">
+          <div class="holdout-title">
+            <span>🛡️ Generalization Holdout Verification</span>
+          </div>
+          <span class="holdout-badge none">Full Dataset CV</span>
+        </div>
+        <div class="holdout-footer-text">
+          Stratified cross-validation evaluated across all available labeled samples. Stratified holdout test partitioning activates when both Likes and Dislikes have at least 2 samples.
+        </div>
+      `;
+    }
+  }
+
+  // Update 2x2 Confusion Matrix Cells
+  const tpEl = document.getElementById("cell-tp");
+  const tpPctEl = document.getElementById("cell-tp-pct");
+  const fnEl = document.getElementById("cell-fn");
+  const fnPctEl = document.getElementById("cell-fn-pct");
+  const fpEl = document.getElementById("cell-fp");
+  const fpPctEl = document.getElementById("cell-fp-pct");
+  const tnEl = document.getElementById("cell-tn");
+  const tnPctEl = document.getElementById("cell-tn-pct");
+
+  if (tpEl) tpEl.textContent = tp;
+  if (tpPctEl) tpPctEl.textContent = `${tpPct}% of Likes`;
+  if (fnEl) fnEl.textContent = fn;
+  if (fnPctEl) fnPctEl.textContent = `${fnPct}% of Likes`;
+  if (fpEl) fpEl.textContent = fp;
+  if (fpPctEl) fpPctEl.textContent = `${fpPct}% of Dislikes`;
+  if (tnEl) tnEl.textContent = tn;
+  if (tnPctEl) tnPctEl.textContent = `${tnPct}% of Dislikes`;
+
+  // Update Matrix Tag
+  const matrixTag = document.getElementById("matrix-eval-tag");
+  if (matrixTag) {
+    matrixTag.textContent = m.evaluation_type === "stratified_cv" ? `${m.folds || 5}-Fold OOF` : "In-Sample";
+  }
+
+  // Update Rates Bar
+  const ratesBar = document.getElementById("matrix-rates-bar");
+  if (ratesBar) {
+    const totalActualDislikes = tn + fp;
+    const spec = totalActualDislikes > 0 ? ((tn / totalActualDislikes) * 100).toFixed(0) : "100";
+    ratesBar.innerHTML = `
+      <div class="rate-item">
+        <span class="rate-val" style="color: #34d399;">${recallPct}%</span>
+        <span class="rate-lbl">True Positive Rate (Sensitivity)</span>
+      </div>
+      <div class="rate-item">
+        <span class="rate-val" style="color: #60a5fa;">${spec}%</span>
+        <span class="rate-lbl">True Negative Rate (Specificity)</span>
+      </div>
+      <div class="rate-item">
+        <span class="rate-val" style="color: var(--accent-purple);">θ = ${(m.decision_threshold || 0.35).toFixed(2)}</span>
+        <span class="rate-lbl">Active Threshold</span>
+      </div>
+    `;
   }
 }
 
 function renderModelTab(model, stats) {
-  const metricsDisplay = document.getElementById("model-metrics-display");
+  const heroStatus = document.getElementById("hero-model-status");
+  const heroStatusText = document.getElementById("hero-status-text");
+  const heroEvalChip = document.getElementById("hero-eval-chip");
+  const heroMeta = document.getElementById("hero-dataset-meta");
+  const kpiGrid = document.getElementById("model-kpi-grid");
 
   if (!model.model_loaded || !model.metrics) {
-    metricsDisplay.innerHTML = `
-      <div class="empty-state" style="padding: 2rem 1rem;">
-        <div class="empty-icon">📊</div>
-        <h4>Model Not Trained Yet</h4>
-        <p>Gather initial ratings in Manual Mode on the library site, then click "Retrain Model" below.</p>
-      </div>
-    `;
+    if (heroStatus) {
+      heroStatus.className = "hero-badge cold-start";
+    }
+    if (heroStatusText) {
+      heroStatusText.textContent = "COLD START";
+    }
+    if (heroEvalChip) {
+      heroEvalChip.textContent = "Awaiting Ratings";
+    }
+    if (heroMeta) {
+      heroMeta.innerHTML = `
+        <span class="hero-stat-pill"><strong>${stats.total_samples || 0}</strong> Samples</span>
+        <span class="hero-stat-pill likes"><strong>${stats.positive_count || 0}</strong> Likes</span>
+      `;
+    }
+    if (kpiGrid) {
+      kpiGrid.innerHTML = `
+        <div class="kpi-card" style="grid-column: span 4; text-align: center; padding: 2.5rem 1rem;">
+          <div style="font-size: 2rem; margin-bottom: 0.5rem;">📊</div>
+          <h4 style="margin-bottom: 0.5rem;">Model Not Trained Yet</h4>
+          <p class="subtext" style="max-width: 480px; margin: 0 auto;">
+            Gather initial ratings in Manual Mode on the art library website, then trigger retraining below.
+          </p>
+        </div>
+      `;
+    }
     return;
   }
 
-  updateMetricsDisplay(model.metrics);
+  // Model Online
+  if (heroStatus) {
+    heroStatus.className = "hero-badge";
+  }
+  if (heroStatusText) {
+    heroStatusText.textContent = "MODEL ONLINE";
+  }
+  if (heroEvalChip) {
+    const folds = model.metrics.folds || 5;
+    heroEvalChip.textContent = model.metrics.evaluation_type === "stratified_cv" ? `Stratified ${folds}-Fold OOF CV` : "In-Sample Evaluation";
+  }
+  if (heroMeta) {
+    const total = stats.total_samples || (model.positive_count + model.negative_count);
+    const pos = model.positive_count || stats.positive_count || 0;
+    const neg = model.negative_count || stats.negative_count || 0;
+    const ratio = total > 0 ? ((pos / total) * 100).toFixed(1) : "0.0";
+    heroMeta.innerHTML = `
+      <span class="hero-stat-pill"><strong>${total}</strong> Labeled Samples</span>
+      <span class="hero-stat-pill likes"><strong>${pos}</strong> Likes (${ratio}%)</span>
+      <span class="hero-stat-pill dislikes"><strong>${neg}</strong> Dislikes</span>
+    `;
+  }
+
+  updateMetricsDisplay(model.metrics, stats);
 
   // Update slider default value only if user is not actively adjusting it
   const slider = document.getElementById("slider-threshold");
@@ -735,38 +985,67 @@ async function confirmAllReviewItems() {
 
 async function handleRetrainModel() {
   const btn = document.getElementById("btn-retrain");
-  const targetRecall = parseFloat(document.getElementById("input-target-recall").value) || 0.90;
-  const thresholdSlider = document.getElementById("slider-threshold");
-  const currentThreshold = thresholdSlider ? parseFloat(thresholdSlider.value) : null;
+  const spinner = document.getElementById("retrain-spinner");
+  const btnText = document.getElementById("retrain-btn-text");
 
-  btn.disabled = true;
-  btn.textContent = "⏳ Training Model...";
+  const strat = document.getElementById("select-calibration-strategy")?.value || "hybrid";
+  const recallParamEl = document.getElementById("input-recall-floor");
+  const recallParam = recallParamEl && !isNaN(parseFloat(recallParamEl.value)) ? parseFloat(recallParamEl.value) : 0.70;
+
+  const holdoutSlider = document.getElementById("input-holdout-ratio");
+  const holdoutRatio = holdoutSlider && !isNaN(parseFloat(holdoutSlider.value)) ? parseFloat(holdoutSlider.value) : 0.15;
+
+  const thresholdSlider = document.getElementById("slider-threshold");
+  const currentThreshold = thresholdSlider && !isNaN(parseFloat(thresholdSlider.value)) ? parseFloat(thresholdSlider.value) : null;
+
+  let payload = {
+    holdout_ratio: holdoutRatio,
+  };
+
+  if (strat === "hybrid") {
+    payload.min_recall_floor = recallParam;
+    payload.target_recall = null;
+    payload.threshold = null;
+  } else if (strat === "target_recall") {
+    payload.target_recall = recallParam;
+    payload.threshold = null;
+  } else if (strat === "manual") {
+    payload.threshold = currentThreshold;
+  }
+
+  if (btn) btn.disabled = true;
+  if (spinner) spinner.classList.remove("hidden");
+  if (btnText) btnText.textContent = "Retraining & Calibrating Model...";
 
   try {
     const res = await fetch("/api/train", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({
-        target_recall: targetRecall,
-        threshold: currentThreshold,
-      }),
+      body: JSON.stringify(payload),
     });
 
     const data = await res.json();
+    if (!res.ok) {
+      throw new Error(data.detail || "Model training failed");
+    }
+
     if (data.status === "insufficient_data") {
       showToast(data.message || "Need more labeled data to train", true);
     } else if (data.status === "trained") {
-      showToast(`Model retrained successfully on ${data.sample_count} samples! (θ=${data.metrics?.decision_threshold})`);
+      const theta = data.metrics?.decision_threshold !== undefined ? data.metrics.decision_threshold.toFixed(2) : "--";
+      showToast(`Model retrained successfully on ${data.sample_count} samples! (θ=${theta})`);
       await fetchMetrics();
     } else {
       showToast("Training completed");
+      await fetchMetrics();
     }
   } catch (err) {
     console.error("Error training model:", err);
-    showToast("Model training failed", true);
+    showToast(`Model training failed: ${err.message || err}`, true);
   } finally {
-    btn.disabled = false;
-    btn.textContent = "🚀 Retrain Model";
+    if (btn) btn.disabled = false;
+    if (spinner) spinner.classList.add("hidden");
+    if (btnText) btnText.textContent = "⚡ Retrain & Calibrate Classifier";
   }
 }
 

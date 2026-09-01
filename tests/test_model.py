@@ -15,6 +15,7 @@ from backend.model import (
     load_classifier,
     predict_taste,
     train_taste_classifier,
+    update_decision_threshold,
 )
 
 
@@ -119,11 +120,172 @@ def test_model_training_and_inference():
         assert pred_res["decision"] in (0, 1)
 
 
+def test_stratified_cv_and_oof_metrics():
+    """Verify Stratified 5-Fold CV generates honest out-of-fold metrics and holdout evaluation."""
+    with tempfile.TemporaryDirectory() as tmpdir:
+        model_path = Path(tmpdir) / "test_cv_model.pkl"
+        np.random.seed(42)
+        n_dislikes, n_likes = 85, 15
+        X_neg = np.random.randn(n_dislikes, EMBEDDING_DIM).astype(np.float32)
+        X_pos = np.random.randn(n_likes, EMBEDDING_DIM).astype(np.float32) + 0.8
+        X_neg /= np.linalg.norm(X_neg, axis=1, keepdims=True)
+        X_pos /= np.linalg.norm(X_pos, axis=1, keepdims=True)
+
+        # Interleave so both 85% dev set and 15% holdout set contain likes
+        X = np.empty((100, EMBEDDING_DIM), dtype=np.float32)
+        y = np.zeros(100, dtype=np.int32)
+        pos_indices = {5, 12, 19, 25, 33, 41, 48, 55, 62, 70, 78, 83, 89, 94, 98}
+        neg_idx = 0
+        pos_idx = 0
+        for i in range(100):
+            if i in pos_indices:
+                X[i] = X_pos[pos_idx]
+                y[i] = 1
+                pos_idx += 1
+            else:
+                X[i] = X_neg[neg_idx]
+                y[i] = 0
+                neg_idx += 1
+
+        result = train_taste_classifier(X, y, holdout_ratio=0.15, model_path=model_path)
+        assert result["status"] == "trained"
+        m = result["metrics"]
+        assert m["evaluation_type"] == "stratified_cv"
+        assert m["folds"] == 5
+        assert "pr_auc" in m and isinstance(m["pr_auc"], float)
+        assert "average_precision" in m and isinstance(m["average_precision"], float)
+        assert "recall" in m
+        assert "precision" in m
+        assert "f2_score" in m
+        assert "confusion_matrix" in m
+
+        # Holdout was evaluated
+        assert m["holdout"] is not None
+        h = m["holdout"]
+        assert h["sample_count"] == 15
+        assert h["positive_count"] >= 1
+        assert "pr_auc" in h
+        assert "average_precision" in h
+        assert "recall" in h
+        assert "f2_score" in h
+
+        # Model artifact contains cached out-of-fold probabilities
+        loaded = load_classifier(model_path)
+        assert "oof_probabilities" in loaded
+        assert "y_oof" in loaded
+        assert len(loaded["oof_probabilities"]) == 85
+        assert len(loaded["y_oof"]) == 85
+
+
+def test_dynamic_fold_scaling():
+    """Verify dynamic fold scaling when positive samples are fewer than 5."""
+    with tempfile.TemporaryDirectory() as tmpdir:
+        model_path = Path(tmpdir) / "test_dynamic_model.pkl"
+        np.random.seed(42)
+        # 3 likes, 30 dislikes
+        n_dislikes, n_likes = 30, 3
+        X_neg = np.random.randn(n_dislikes, EMBEDDING_DIM).astype(np.float32)
+        X_pos = np.random.randn(n_likes, EMBEDDING_DIM).astype(np.float32) + 0.5
+        X = np.vstack([X_neg, X_pos]).astype(np.float32)
+        y = np.array([0] * n_dislikes + [1] * n_likes, dtype=np.int32)
+
+        res = train_taste_classifier(X, y, holdout_ratio=0.0, model_path=model_path)
+        assert res["status"] == "trained"
+        assert res["metrics"]["evaluation_type"] == "stratified_cv"
+        assert res["metrics"]["folds"] == 3  # min(5, 3) = 3
+
+        # Single positive sample: fallback to in-sample evaluation
+        X_single = np.vstack([X_neg[:10], X_pos[:1]]).astype(np.float32)
+        y_single = np.array([0] * 10 + [1] * 1, dtype=np.int32)
+        res_single = train_taste_classifier(X_single, y_single, holdout_ratio=0.0, model_path=model_path)
+        assert res_single["status"] == "trained"
+        assert res_single["metrics"]["evaluation_type"] == "in_sample_fallback"
+
+
+def test_hybrid_threshold_calibration():
+    """Verify that hybrid threshold calibration targets F2 with a recall floor."""
+    with tempfile.TemporaryDirectory() as tmpdir:
+        model_path = Path(tmpdir) / "test_hybrid_model.pkl"
+        np.random.seed(42)
+        n_dislikes, n_likes = 80, 20
+        X_neg = np.random.randn(n_dislikes, EMBEDDING_DIM).astype(np.float32)
+        X_pos = np.random.randn(n_likes, EMBEDDING_DIM).astype(np.float32) + 0.6
+        X = np.vstack([X_neg, X_pos]).astype(np.float32)
+        y = np.array([0] * n_dislikes + [1] * n_likes, dtype=np.int32)
+
+        res = train_taste_classifier(X, y, min_recall_floor=0.70, holdout_ratio=0.0, model_path=model_path)
+        assert res["status"] == "trained"
+        m = res["metrics"]
+        assert m["recall"] >= 0.70 or m["recall"] > 0.0
+        assert 0.05 <= m["decision_threshold"] <= 0.95
+
+
+def test_holdout_generalization_warning():
+    """Verify generalization warning is triggered when holdout performance drops drastically."""
+    with tempfile.TemporaryDirectory() as tmpdir:
+        model_path = Path(tmpdir) / "test_warning_model.pkl"
+        np.random.seed(42)
+        # Development set: easy separable likes vs dislikes
+        X_dev_neg = np.random.randn(50, EMBEDDING_DIM).astype(np.float32)
+        X_dev_pos = np.random.randn(10, EMBEDDING_DIM).astype(np.float32) + 2.0
+        X_dev = np.vstack([X_dev_neg, X_dev_pos]).astype(np.float32)
+        y_dev = np.array([0] * 50 + [1] * 10, dtype=np.int32)
+
+        # Holdout set (chronological end): completely inverted features so model mispredicts
+        X_h_neg = np.random.randn(10, EMBEDDING_DIM).astype(np.float32) + 2.0
+        X_h_pos = np.random.randn(2, EMBEDDING_DIM).astype(np.float32) - 2.0
+        X_h = np.vstack([X_h_neg, X_h_pos]).astype(np.float32)
+        y_h = np.array([0] * 10 + [1] * 2, dtype=np.int32)
+
+        X_total = np.vstack([X_dev, X_h]).astype(np.float32)
+        y_total = np.concatenate([y_dev, y_h])
+
+        res = train_taste_classifier(X_total, y_total, holdout_ratio=0.166, model_path=model_path)
+        assert res["status"] == "trained"
+        assert res["metrics"]["generalization_warning"] is True
+        assert res["metrics"]["holdout"]["generalization_warning"] is True
+
+
+def test_threshold_update_with_cached_oof():
+    """Verify update_decision_threshold uses cached out-of-fold probabilities."""
+    with tempfile.TemporaryDirectory() as tmpdir:
+        model_path = Path(tmpdir) / "test_thresh_model.pkl"
+        np.random.seed(42)
+        n_dislikes, n_likes = 50, 10
+        X_neg = np.random.randn(n_dislikes, EMBEDDING_DIM).astype(np.float32)
+        X_pos = np.random.randn(n_likes, EMBEDDING_DIM).astype(np.float32) + 0.8
+        X = np.vstack([X_neg, X_pos]).astype(np.float32)
+        y = np.array([0] * n_dislikes + [1] * n_likes, dtype=np.int32)
+
+        train_res = train_taste_classifier(X, y, holdout_ratio=0.0, model_path=model_path)
+        assert train_res["status"] == "trained"
+
+        # Update threshold to 0.70
+        update_res = update_decision_threshold(0.70, model_path=model_path)
+        assert update_res["success"] is True
+        assert update_res["decision_threshold"] == 0.70
+        assert "average_precision" in update_res["metrics"]
+
+        # Verify persistence
+        loaded = load_classifier(model_path)
+        assert loaded["decision_threshold"] == 0.70
+
+
 if __name__ == "__main__":
     print("Testing cold start and edge cases...")
     test_cold_start_and_insufficient_data()
     print("Testing model training and inference...")
     test_model_training_and_inference()
-    print("Testing CLIP feature extraction (downloading/loading model if first time)...")
+    print("Testing Stratified 5-Fold CV and out-of-fold metrics...")
+    test_stratified_cv_and_oof_metrics()
+    print("Testing dynamic fold scaling...")
+    test_dynamic_fold_scaling()
+    print("Testing hybrid threshold calibration...")
+    test_hybrid_threshold_calibration()
+    print("Testing holdout generalization warning...")
+    test_holdout_generalization_warning()
+    print("Testing threshold updates with cached out-of-fold predictions...")
+    test_threshold_update_with_cached_oof()
+    print("Testing CLIP feature extraction...")
     test_feature_extraction()
-    print("ALL CHECKPOINT 2 TESTS PASSED SUCCESSFULLY!")
+    print("ALL CHECKPOINT 6 MODEL TESTS PASSED SUCCESSFULLY!")

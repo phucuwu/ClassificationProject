@@ -8,7 +8,7 @@
   <link rel="preconnect" href="https://fonts.googleapis.com">
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
   <link href="https://fonts.googleapis.com/css2?family=Outfit:wght@300;400;500;600;700&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet">
-  <link rel="stylesheet" href="style.css">
+  <link rel="stylesheet" href="style.css?v=2.1">
 </head>
 <body>
   <div id="app" class="dashboard-layout">
@@ -268,65 +268,181 @@
 
       <!-- View 3: Model & Metrics -->
       <section id="tab-model" class="tab-panel">
+        <!-- Model Health & Architecture Hero Banner -->
+        <div class="model-hero-banner" id="model-hero-banner">
+          <div class="hero-status-group">
+            <div class="hero-badge" id="hero-model-status">
+              <span class="status-indicator live"></span>
+              <span id="hero-status-text">MODEL ONLINE</span>
+            </div>
+            <div class="hero-chip">clip-ViT-L-14 + Balanced Logistic Regression</div>
+            <div class="hero-chip" id="hero-eval-chip">Stratified 5-Fold OOF CV</div>
+          </div>
+          <div class="hero-meta-group" id="hero-dataset-meta">
+            <!-- Populated dynamically: Total samples, likes ratio -->
+          </div>
+        </div>
+
+        <!-- Top KPI Cards Grid -->
+        <div class="model-kpi-grid" id="model-kpi-grid">
+          <!-- Dynamically populated KPI cards -->
+        </div>
+
         <div class="model-grid-layout">
-          <!-- Left Column: Metrics Overview -->
+          <!-- Left Column: Generalization & Retrain Studio -->
           <div class="metric-card">
-            <h3>Taste Classifier Status</h3>
-            <div class="model-metrics-summary" id="model-metrics-display">
-              <!-- Dynamically populated metrics -->
+            <div class="card-header-flex">
+              <div>
+                <h3>Generalization & Retraining Studio</h3>
+                <p class="subtext">Out-of-fold validation, holdout generalization verification, and calibration controls.</p>
+              </div>
+            </div>
+
+            <!-- Holdout Verification Box -->
+            <div class="holdout-card-section" id="holdout-summary-container">
+              <!-- Dynamically populated holdout metrics -->
             </div>
 
             <hr class="card-divider">
 
-            <div class="retrain-section">
-              <h4>Retrain Taste Classifier</h4>
-              <p class="subtext">Fits balanced Logistic Regression on all labeled samples in the dataset.</p>
-              <div class="form-row">
-                <label for="input-target-recall">Target Recall (Sensitivity):</label>
-                <input type="number" id="input-target-recall" class="number-input" min="0.5" max="0.99" step="0.05" value="0.90">
+            <!-- Retraining Studio -->
+            <div class="retrain-studio-section">
+              <div class="section-title-badge">Model Retraining & Calibration</div>
+              
+              <div class="retrain-settings-box">
+                <div class="form-grid-2col">
+                  <div class="form-group">
+                    <label for="select-calibration-strategy">Calibration Strategy:</label>
+                    <select id="select-calibration-strategy" class="select-input">
+                      <option value="hybrid" selected>Hybrid (Max F₂ with Recall Floor)</option>
+                      <option value="target_recall">Target Recall Quota</option>
+                      <option value="manual">Keep Manual Threshold</option>
+                    </select>
+                  </div>
+
+                  <div class="form-group" id="group-recall-floor">
+                    <label for="input-recall-floor" id="lbl-recall-param">Recall Floor (0.70):</label>
+                    <input type="number" id="input-recall-floor" class="number-input" min="0.50" max="0.99" step="0.05" value="0.70">
+                  </div>
+                </div>
+
+                <div class="form-group holdout-setting-group">
+                  <div class="holdout-setting-header">
+                    <label for="input-holdout-ratio">Holdout Test Partition:</label>
+                    <span class="holdout-val-badge" id="display-holdout-val">15%</span>
+                  </div>
+                  <div class="holdout-slider-wrap">
+                    <input type="range" id="input-holdout-ratio" class="slider-input" min="0.0" max="0.30" step="0.05" value="0.15">
+                  </div>
+                  <div class="holdout-hint-text">
+                    Reserves a stratified split to verify generalization on unseen samples before final model refit.
+                  </div>
+                </div>
               </div>
-              <button id="btn-retrain" class="btn btn-primary btn-large">
-                🚀 Retrain Model
+
+              <button id="btn-retrain" class="btn btn-primary btn-large btn-retrain-action" style="margin-top: 1.25rem; width: 100%;">
+                <span class="btn-spinner hidden" id="retrain-spinner"></span>
+                <span id="retrain-btn-text">⚡ Retrain & Calibrate Classifier</span>
               </button>
             </div>
           </div>
 
-          <!-- Right Column: Threshold & Matrix -->
+          <!-- Right Column: Decision Threshold & Confusion Matrix -->
           <div class="metric-card">
-            <h3>Decision Threshold & Confusion Matrix</h3>
-            <p class="subtext">Threshold determines the probability cutoff for predicting positive class (Like).</p>
-
-            <div class="threshold-slider-container">
-              <div class="slider-header">
-                <label for="slider-threshold">Active Threshold (θ):</label>
-                <span class="threshold-value" id="display-threshold-val">0.35</span>
+            <div class="card-header-flex">
+              <div>
+                <h3>Decision Threshold & Confusion Matrix</h3>
+                <p class="subtext">Tune probability cutoff θ with real-time out-of-fold confusion matrix recalculation.</p>
               </div>
-              <input type="range" id="slider-threshold" class="slider-input" min="0.10" max="0.90" step="0.01" value="0.35">
             </div>
 
+            <!-- Threshold Slider Container -->
+            <div class="threshold-slider-container">
+              <div class="slider-header">
+                <div class="slider-label-group">
+                  <label for="slider-threshold">Active Decision Threshold (θ):</label>
+                  <span class="slider-hint">Probability cutoff for predicting Like</span>
+                </div>
+                <span class="threshold-value" id="display-threshold-val">0.35</span>
+              </div>
+              <input type="range" id="slider-threshold" class="slider-input" min="0.05" max="0.95" step="0.01" value="0.35">
+
+              <!-- Quick Presets -->
+              <div class="threshold-presets">
+                <button type="button" class="preset-chip" data-val="0.20">High Recall (0.20)</button>
+                <button type="button" class="preset-chip" data-val="0.35">Balanced (0.35)</button>
+                <button type="button" class="preset-chip" data-val="0.50">High Precision (0.50)</button>
+              </div>
+            </div>
+
+            <!-- Confusion Matrix Modern 2x2 Grid -->
             <div class="confusion-matrix-container">
-              <h4>Confusion Matrix</h4>
-              <table class="confusion-table" id="table-confusion-matrix">
-                <thead>
-                  <tr>
-                    <th></th>
-                    <th>Actual Like (1)</th>
-                    <th>Actual Dislike (0)</th>
-                  </tr>
-                </thead>
-                <tbody>
-                  <tr>
-                    <td class="row-header">Predicted Like</td>
-                    <td class="cell-tp" id="cell-tp">0</td>
-                    <td class="cell-fp" id="cell-fp">0</td>
-                  </tr>
-                  <tr>
-                    <td class="row-header">Predicted Dislike</td>
-                    <td class="cell-fn" id="cell-fn">0</td>
-                    <td class="cell-tn" id="cell-tn">0</td>
-                  </tr>
-                </tbody>
-              </table>
+              <div class="matrix-header">
+                <div class="matrix-title-group">
+                  <h4>Out-of-Fold Confusion Matrix</h4>
+                  <span class="matrix-sub">Cross-validated decision evaluation</span>
+                </div>
+                <span class="matrix-tag" id="matrix-eval-tag">OOF Validated</span>
+              </div>
+
+              <div class="matrix-2x2-wrapper">
+                <!-- Top Column Labels Header -->
+                <div class="matrix-col-headers">
+                  <div class="matrix-corner-label">Actual \ Predicted</div>
+                  <div class="matrix-col-label col-pos">
+                    <span class="col-pill">Predicted Like (1)</span>
+                  </div>
+                  <div class="matrix-col-label col-neg">
+                    <span class="col-pill">Predicted Dislike (0)</span>
+                  </div>
+                </div>
+
+                <!-- Row 1: Actual Like -->
+                <div class="matrix-row">
+                  <div class="matrix-row-label row-pos">
+                    <span class="row-pill">Actual Like (1)</span>
+                  </div>
+                  <!-- TP -->
+                  <div class="quad-cell quad-tp">
+                    <div class="quad-badge">TP</div>
+                    <div class="quad-val" id="cell-tp">0</div>
+                    <div class="quad-pct" id="cell-tp-pct">0% of Likes</div>
+                    <div class="quad-title">True Positives</div>
+                  </div>
+                  <!-- FN -->
+                  <div class="quad-cell quad-fn">
+                    <div class="quad-badge">FN</div>
+                    <div class="quad-val" id="cell-fn">0</div>
+                    <div class="quad-pct" id="cell-fn-pct">0% of Likes</div>
+                    <div class="quad-title">False Negatives</div>
+                  </div>
+                </div>
+
+                <!-- Row 2: Actual Dislike -->
+                <div class="matrix-row">
+                  <div class="matrix-row-label row-neg">
+                    <span class="row-pill">Actual Dislike (0)</span>
+                  </div>
+                  <!-- FP -->
+                  <div class="quad-cell quad-fp">
+                    <div class="quad-badge">FP</div>
+                    <div class="quad-val" id="cell-fp">0</div>
+                    <div class="quad-pct" id="cell-fp-pct">0% of Dislikes</div>
+                    <div class="quad-title">False Positives</div>
+                  </div>
+                  <!-- TN -->
+                  <div class="quad-cell quad-tn">
+                    <div class="quad-badge">TN</div>
+                    <div class="quad-val" id="cell-tn">0</div>
+                    <div class="quad-pct" id="cell-tn-pct">0% of Dislikes</div>
+                    <div class="quad-title">True Negatives</div>
+                  </div>
+                </div>
+              </div>
+
+              <div class="matrix-rates-bar" id="matrix-rates-bar">
+                <!-- Sensitivity / Specificity rates -->
+              </div>
             </div>
           </div>
         </div>
@@ -387,6 +503,6 @@
     <div id="toast-container" class="toast-container"></div>
   </div>
 
-  <script src="app.js"></script>
+  <script src="app.js?v=2.1"></script>
 </body>
 </html>

@@ -13,7 +13,7 @@ from pathlib import Path
 from typing import Any
 
 import mss
-from fastapi import FastAPI, HTTPException, Query, status
+from fastapi import FastAPI, HTTPException, Query, Request, status
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 from PIL import Image
@@ -104,6 +104,16 @@ app.add_middleware(
 )
 
 
+@app.middleware("http")
+async def add_no_cache_headers(request: Request, call_next):
+    response = await call_next(request)
+    if any(request.url.path.endswith(ext) for ext in (".html", ".css", ".js", "/", "/api/metrics")):
+        response.headers["Cache-Control"] = "no-cache, no-store, must-revalidate"
+        response.headers["Pragma"] = "no-cache"
+        response.headers["Expires"] = "0"
+    return response
+
+
 @app.get("/api/logs")
 def get_activity_logs(
     limit: int = Query(100, ge=1, le=500, description="Max logs to return."),
@@ -163,8 +173,10 @@ class CaptureRequest(BaseModel):
 
 
 class TrainRequest(BaseModel):
-    target_recall: float | None = Field(0.90, description="Target recall rate for decision threshold calibration.")
+    target_recall: float | None = Field(None, description="Optional target recall rate for decision threshold calibration.")
     threshold: float | None = Field(None, description="Optional explicit threshold override.")
+    min_recall_floor: float = Field(0.70, ge=0.05, le=0.95, description="Minimum recall floor for hybrid F2 threshold calibration.")
+    holdout_ratio: float = Field(0.15, ge=0.0, le=0.50, description="Fraction of most recent samples reserved for generalization holdout.")
 
 
 class ThresholdRequest(BaseModel):
@@ -352,18 +364,29 @@ def train_model(payload: TrainRequest = TrainRequest()) -> dict[str, Any]:
         result = train_taste_classifier(
             X,
             y,
-            target_recall=payload.target_recall if payload.target_recall is not None else 0.90,
+            target_recall=payload.target_recall,
             threshold=payload.threshold,
+            min_recall_floor=payload.min_recall_floor,
+            holdout_ratio=payload.holdout_ratio,
         )
 
         if result.get("status") == "trained":
             m = result.get("metrics", {})
+            eval_info = f" ({m.get('evaluation_type', 'cv')}, {m.get('folds', 5)} folds)" if m.get("folds") else ""
             add_activity_log(
                 "SUCCESS",
                 "model_trained",
-                f"Model retrained successfully on {result.get('sample_count')} samples (PR-AUC: {m.get('pr_auc')}, Recall: {m.get('recall')}, θ: {m.get('decision_threshold')})",
+                f"Model retrained on {result.get('sample_count')} samples: OOF PR-AUC {m.get('pr_auc')}, Recall {m.get('recall')}, θ={m.get('decision_threshold')}{eval_info}",
                 details=m,
             )
+            if m.get("generalization_warning"):
+                h = m.get("holdout", {})
+                add_activity_log(
+                    "WARNING",
+                    "generalization_warning",
+                    f"Holdout generalization drop: Holdout PR-AUC {h.get('pr_auc')} is significantly below OOF PR-AUC {m.get('pr_auc')}.",
+                    details=h,
+                )
         else:
             add_activity_log("WARNING", "train_insufficient_data", result.get("message", "Insufficient samples to train."))
 
