@@ -9,9 +9,16 @@ from __future__ import annotations
 
 import base64
 import io
+import os
 import pickle
+import warnings
 from pathlib import Path
 from typing import Any
+
+# Suppress Hugging Face Hub unauthenticated request notice for public models
+os.environ.setdefault("HF_HUB_DISABLE_IMPLICIT_TOKEN", "1")
+warnings.filterwarnings("ignore", message=".*unauthenticated requests to the HF Hub.*")
+warnings.filterwarnings("ignore", category=DeprecationWarning, module="starlette.*")
 
 import numpy as np
 import torch

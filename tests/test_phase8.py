@@ -198,6 +198,94 @@ def test_record_near_duplicate_consolidation_api():
             model_mod.MODEL_PATH = orig_model
 
 
+def test_near_duplicate_preserves_human_reviewed_label():
+    """Verify that automated unreviewed decisions cannot overwrite verified human labels on near-duplicates."""
+    with tempfile.TemporaryDirectory() as tmpdir:
+        test_db = Path(tmpdir) / "test.db"
+        test_model = Path(tmpdir) / "test_model.pkl"
+        test_images = Path(tmpdir) / "images"
+        init_db(test_db)
+
+        orig_db = db_mod.DEFAULT_DB_PATH
+        orig_images = db_mod.IMAGES_DIR
+        orig_model = model_mod.MODEL_PATH
+        db_mod.DEFAULT_DB_PATH = test_db
+        db_mod.IMAGES_DIR = test_images
+        model_mod.MODEL_PATH = test_model
+
+        try:
+            client = TestClient(app)
+
+            canonical_vec = np.zeros(768, dtype=np.float32)
+            canonical_vec[0] = 1.0
+
+            near_dup_vec = canonical_vec.copy()
+            near_dup_vec[1] = 0.05
+            near_dup_vec = near_dup_vec / np.linalg.norm(near_dup_vec)
+
+            with patch("backend.app.extract_vision_embedding") as mock_extract:
+                # 1. Human records manual like (label=1, reviewed=1)
+                mock_extract.return_value = canonical_vec
+                img_b64_1 = _make_test_image_b64((100, 100, 100))
+                resp1 = client.post("/api/record", json={
+                    "image_base64": img_b64_1,
+                    "label": 1,
+                    "mode": "manual",
+                    "reviewed": 1,
+                })
+                assert resp1.status_code == 201
+                orig_id = resp1.json()["id"]
+
+                # 2. Scraper encounters near-duplicate in full auto mode with dislike prediction (label=0, reviewed=0)
+                mock_extract.return_value = near_dup_vec
+                img_b64_2 = _make_test_image_b64((104, 100, 100))
+                resp2 = client.post("/api/record", json={
+                    "image_base64": img_b64_2,
+                    "label": 0,
+                    "mode": "auto",
+                    "prediction_score": 0.12,
+                    "reviewed": 0,
+                })
+                assert resp2.status_code == 201
+                data2 = resp2.json()
+                assert data2["status"] == "consolidated"
+                assert data2["id"] == orig_id
+                # Label must remain 1 and reviewed must remain 1
+                assert data2["label"] == 1
+                assert data2["reviewed"] == 1
+
+                # Check database row directly
+                samples = client.get("/api/samples").json()
+                assert len(samples) == 1
+                assert samples[0]["id"] == orig_id
+                assert samples[0]["label"] == 1
+                assert samples[0]["reviewed"] == 1
+
+                # 3. User explicitly overrides in supervised mode (label=0, reviewed=1)
+                resp3 = client.post("/api/record", json={
+                    "image_base64": img_b64_2,
+                    "label": 0,
+                    "mode": "supervised",
+                    "reviewed": 1,
+                })
+                assert resp3.status_code == 201
+                data3 = resp3.json()
+                assert data3["status"] == "consolidated"
+                assert data3["label"] == 0
+                assert data3["reviewed"] == 1
+
+                # Check database row updated after human confirmation
+                samples_updated = client.get("/api/samples").json()
+                assert len(samples_updated) == 1
+                assert samples_updated[0]["label"] == 0
+                assert samples_updated[0]["reviewed"] == 1
+
+        finally:
+            db_mod.DEFAULT_DB_PATH = orig_db
+            db_mod.IMAGES_DIR = orig_images
+            model_mod.MODEL_PATH = orig_model
+
+
 def test_samples_outliers_query_endpoint():
     """Verify GET /api/samples?outliers_only=true filters and tags inconsistent positive ratings."""
     with tempfile.TemporaryDirectory() as tmpdir:

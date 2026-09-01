@@ -9,7 +9,7 @@ from __future__ import annotations
 import os
 import sqlite3
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal, overload
 
 import numpy as np
 
@@ -268,6 +268,30 @@ def delete_samples(
         conn.close()
 
 
+@overload
+def load_training_matrix(
+    db_path: Path | str | None = None,
+    return_ids: Literal[False] = False,
+) -> tuple[np.ndarray, np.ndarray]:
+    ...
+
+
+@overload
+def load_training_matrix(
+    db_path: Path | str | None = None,
+    return_ids: Literal[True] = ...,
+) -> tuple[np.ndarray, np.ndarray, list[int]]:
+    ...
+
+
+@overload
+def load_training_matrix(
+    db_path: Path | str | None = None,
+    return_ids: bool = False,
+) -> tuple[np.ndarray, np.ndarray] | tuple[np.ndarray, np.ndarray, list[int]]:
+    ...
+
+
 def load_training_matrix(
     db_path: Path | str | None = None,
     return_ids: bool = False,
@@ -450,6 +474,7 @@ def find_near_duplicate(
             "image_hash": matched["image_hash"],
             "file_path": matched["file_path"],
             "label": matched["label"],
+            "mode": matched["mode"],
             "reviewed": matched["reviewed"],
         }
     return None
@@ -506,5 +531,36 @@ def update_sample_record(
             return cursor.rowcount > 0
     finally:
         conn.close()
+
+
+def get_recent_samples(
+    limit: int = 100,
+    db_path: Path | str | None = None,
+) -> list[dict[str, Any]]:
+    """Retrieve the most recent N samples for rolling session drift analysis.
+
+    Args:
+        limit: Number of recent samples to query (default 100).
+        db_path: Optional path to SQLite database file.
+
+    Returns:
+        List of sample dictionaries with id, label, prediction_score, mode, reviewed, and created_at.
+    """
+    conn = get_db_connection(db_path)
+    try:
+        cursor = conn.execute(
+            """
+            SELECT id, label, prediction_score, mode, reviewed, created_at
+            FROM samples
+            ORDER BY id DESC
+            LIMIT ?;
+            """,
+            (limit,),
+        )
+        rows = cursor.fetchall()
+        return [dict(row) for row in rows]
+    finally:
+        conn.close()
+
 
 

@@ -9,8 +9,16 @@ from __future__ import annotations
 import base64
 import hashlib
 import io
+import os
+import warnings
 from pathlib import Path
 from typing import Any
+
+# Filter third-party library deprecation notices
+os.environ.setdefault("HF_HUB_DISABLE_IMPLICIT_TOKEN", "1")
+warnings.filterwarnings("ignore", category=DeprecationWarning, module="starlette.*")
+warnings.filterwarnings("ignore", category=DeprecationWarning, module="fastapi.*")
+warnings.filterwarnings("ignore", message=".*unauthenticated requests to the HF Hub.*")
 
 import mss
 from fastapi import FastAPI, HTTPException, Query, Request, status
@@ -19,11 +27,14 @@ from fastapi.staticfiles import StaticFiles
 from PIL import Image
 from pydantic import BaseModel, Field
 
+import random
+
+import numpy as np
+
+import backend.database as db
 from backend.database import (
-    DATA_DIR,
-    DEFAULT_DB_PATH,
-    IMAGES_DIR,
     get_dataset_statistics,
+    get_recent_samples,
     get_samples,
     init_db,
     insert_sample,
@@ -162,6 +173,7 @@ class RecordRequest(BaseModel):
     prediction_score: float | None = Field(None, description="Model prediction score P(Like) between 0.0 and 1.0.")
     reviewed: int = Field(0, description="1 if confirmed by human, 0 if pending review.")
     image_set_count: int | None = Field(None, description="Total photos detected in the active card's image set.")
+    negative_sample_rate: float = Field(0.05, ge=0.0, le=1.0, description="Audit rate for sampling automated negative decisions into review queue.")
 
 
 class PredictRequest(BaseModel):
@@ -242,6 +254,55 @@ def _decode_and_save_image(image_base64: str) -> tuple[bytes, str, Path]:
     return image_bytes, image_hash, file_path
 
 
+def check_session_drift(db_path: Path | str | None = None, window_size: int = 100, min_window: int = 20) -> dict[str, Any] | None:
+    """Analyze rolling window of recent samples to detect taste preference session drift.
+
+    Emits a WARNING activity log if the positive class ratio deviates outside [0.05, 0.10].
+    """
+    effective_db = db_path if db_path is not None else db.DEFAULT_DB_PATH
+    recent = db.get_recent_samples(limit=window_size, db_path=effective_db)
+    labeled = [s for s in recent if s["label"] is not None]
+    if len(labeled) < min_window:
+        return None
+
+    pos_count = sum(1 for s in labeled if s["label"] == 1)
+    sample_count = len(labeled)
+    pos_ratio = pos_count / sample_count
+
+    scores = [s["prediction_score"] for s in labeled if s.get("prediction_score") is not None]
+    avg_score = float(sum(scores) / len(scores)) if scores else None
+
+    drift_detected = pos_ratio < 0.05 or pos_ratio > 0.10
+    if drift_detected:
+        direction = "low" if pos_ratio < 0.05 else "high"
+        msg = (
+            f"Taste session drift warning: rolling positive ratio is {pos_ratio:.1%} "
+            f"({pos_count}/{sample_count} likes, {direction} vs expected 5%-10% range)."
+        )
+        if avg_score is not None:
+            msg += f" Mean score: {avg_score:.2f}."
+        add_activity_log(
+            level="WARNING",
+            event="session_drift",
+            message=msg,
+            details={
+                "window_size": sample_count,
+                "positive_count": pos_count,
+                "positive_ratio": round(pos_ratio, 4),
+                "mean_prediction_score": round(avg_score, 4) if avg_score is not None else None,
+                "expected_range": [0.05, 0.10],
+            },
+        )
+
+    return {
+        "window_size": sample_count,
+        "positive_count": pos_count,
+        "positive_ratio": pos_ratio,
+        "mean_prediction_score": avg_score,
+        "drift_detected": drift_detected,
+    }
+
+
 @app.post("/api/record", status_code=status.HTTP_201_CREATED)
 def record_sample(payload: RecordRequest) -> dict[str, Any]:
     """Ingest a sample with an image, label, and mode. Extracts and saves the vision embedding."""
@@ -252,41 +313,74 @@ def record_sample(payload: RecordRequest) -> dict[str, Any]:
         image_bytes = base64.b64decode(raw_str)
         embedding = extract_vision_embedding(image_bytes)
 
+        # Determine reviewed status with negative sampling for full auto mode
+        reviewed_status = payload.reviewed
+        sampled_for_review = False
+        if payload.mode == "auto":
+            if payload.label == 1:
+                # All automated positive decisions enter review queue
+                reviewed_status = 0
+            elif payload.label == 0:
+                # Dislikes are sampled at negative_sample_rate (default 5%)
+                if random.random() < payload.negative_sample_rate:
+                    reviewed_status = 0
+                    sampled_for_review = True
+                else:
+                    reviewed_status = 1
+
         # Check for near-duplicate artwork before saving new image file or inserting row
-        near_dup = find_near_duplicate(embedding, threshold=0.98)
+        near_dup = find_near_duplicate(embedding, threshold=0.98, db_path=db.DEFAULT_DB_PATH)
         label_str = "LIKE (1)" if payload.label == 1 else ("DISLIKE (0)" if payload.label == 0 else "UNLABELED")
         set_str = f" [Set: {payload.image_set_count} photos]" if payload.image_set_count and payload.image_set_count > 1 else ""
 
         if near_dup is not None:
             canonical_id = int(near_dup["id"])
+            target_label = payload.label
+            target_mode = payload.mode
+            target_reviewed = reviewed_status
+
+            # Protect verified human decisions from being overwritten by unreviewed automated guesses
+            if near_dup.get("reviewed") == 1 and payload.mode == "auto":
+                target_label = near_dup["label"]
+                target_mode = near_dup.get("mode", payload.mode)
+                target_reviewed = 1
+            elif target_label is None and near_dup.get("label") is not None:
+                target_label = near_dup["label"]
+
             update_sample_record(
                 canonical_id,
-                label=payload.label,
-                mode=payload.mode,
+                label=target_label,
+                mode=target_mode,
                 prediction_score=payload.prediction_score,
-                reviewed=payload.reviewed,
+                reviewed=target_reviewed,
+                db_path=db.DEFAULT_DB_PATH,
             )
             sim_val = float(near_dup["similarity"])
+            final_label_str = "LIKE (1)" if target_label == 1 else ("DISLIKE (0)" if target_label == 0 else "UNLABELED")
             add_activity_log(
                 "INFO",
                 "duplicate_consolidated",
-                f"Near-duplicate artwork detected (sim={sim_val:.4f} with #{canonical_id}): consolidated into sample #{canonical_id} as {label_str}{set_str}",
+                f"Near-duplicate artwork detected (sim={sim_val:.4f} with #{canonical_id}): consolidated into sample #{canonical_id} as {final_label_str}{set_str}",
                 mode=payload.mode,
                 details={
                     "id": canonical_id,
                     "similarity": sim_val,
                     "image_hash": near_dup["image_hash"],
-                    "label": payload.label,
+                    "label": target_label,
+                    "reviewed": target_reviewed,
+                    "original_label": near_dup["label"],
                     "image_set_count": payload.image_set_count,
                 },
             )
+            check_session_drift(db_path=db.DEFAULT_DB_PATH)
             return {
                 "status": "consolidated",
                 "id": canonical_id,
                 "duplicate_of": canonical_id,
                 "similarity": sim_val,
                 "image_hash": near_dup["image_hash"],
-                "label": payload.label,
+                "label": target_label,
+                "reviewed": target_reviewed,
             }
 
         # If not a near-duplicate, save image to disk and insert new sample
@@ -299,7 +393,8 @@ def record_sample(payload: RecordRequest) -> dict[str, Any]:
             label=payload.label,
             mode=payload.mode,
             prediction_score=payload.prediction_score,
-            reviewed=payload.reviewed,
+            reviewed=reviewed_status,
+            db_path=db.DEFAULT_DB_PATH,
         )
 
         if payload.mode == "manual":
@@ -312,13 +407,22 @@ def record_sample(payload: RecordRequest) -> dict[str, Any]:
             )
         elif payload.mode == "auto":
             score_str = f"{payload.prediction_score:.2f}" if payload.prediction_score is not None else "N/A"
-            add_activity_log(
-                "INFO",
-                "auto_decision",
-                f"Auto decision: Sample #{sample_id} ({image_hash[:8]}...) rated as {label_str} (Score: {score_str}){set_str}",
-                mode="auto",
-                details={"id": sample_id, "label": payload.label, "score": payload.prediction_score, "image_set_count": payload.image_set_count},
-            )
+            if sampled_for_review:
+                add_activity_log(
+                    "INFO",
+                    "negative_sampled_for_review",
+                    f"Auto decision: Sample #{sample_id} ({image_hash[:8]}...) rated DISLIKE (Score: {score_str}) -> Sampled into Review Queue (5% audit rate){set_str}",
+                    mode="auto",
+                    details={"id": sample_id, "label": payload.label, "score": payload.prediction_score, "sampled_for_review": True},
+                )
+            else:
+                add_activity_log(
+                    "INFO",
+                    "auto_decision",
+                    f"Auto decision: Sample #{sample_id} ({image_hash[:8]}...) rated as {label_str} (Score: {score_str}){set_str}",
+                    mode="auto",
+                    details={"id": sample_id, "label": payload.label, "score": payload.prediction_score, "image_set_count": payload.image_set_count},
+                )
         else:
             add_activity_log(
                 "SUCCESS",
@@ -328,11 +432,14 @@ def record_sample(payload: RecordRequest) -> dict[str, Any]:
                 details={"id": sample_id, "label": payload.label, "image_set_count": payload.image_set_count},
             )
 
+        check_session_drift(db_path=db.DEFAULT_DB_PATH)
+
         return {
             "status": "success",
             "id": sample_id,
             "image_hash": image_hash,
             "label": payload.label,
+            "reviewed": reviewed_status,
         }
     except Exception as exc:
         add_activity_log("ERROR", "record_failed", f"Failed to record sample: {str(exc)}", mode=payload.mode)
@@ -498,7 +605,7 @@ def query_samples(
 
     try:
         import numpy as np
-        X_all, y_all, ids_all = load_training_matrix(return_ids=True)
+        X_all, y_all, ids_all = load_training_matrix(return_ids=True, db_path=db.DEFAULT_DB_PATH)
         if len(y_all) > 0:
             if filter_likes:
                 if np.any(y_all == 1):
@@ -535,6 +642,7 @@ def query_samples(
             label=target_label,
             limit=limit,
             offset=offset,
+            db_path=db.DEFAULT_DB_PATH,
         )
     else:
         samples = get_samples(
@@ -543,10 +651,10 @@ def query_samples(
             label=label,
             limit=limit,
             offset=offset,
+            db_path=db.DEFAULT_DB_PATH,
         )
 
-    import backend.database as _db
-    images_dir = Path(_db.IMAGES_DIR)
+    images_dir = Path(db.IMAGES_DIR)
 
     results: list[dict[str, Any]] = []
     for sample in samples:
@@ -594,7 +702,7 @@ def review_samples(payload: ReviewRequest) -> dict[str, Any]:
     """Bulk update labels and mark samples as reviewed."""
     try:
         updates = [item.dict() for item in payload.updates]
-        updated_count = update_sample_reviews(updates)
+        updated_count = update_sample_reviews(updates, db_path=db.DEFAULT_DB_PATH)
         return {
             "status": "success",
             "updated_count": updated_count,
@@ -610,7 +718,7 @@ def review_samples(payload: ReviewRequest) -> dict[str, Any]:
 def delete_single_sample(sample_id: int) -> dict[str, Any]:
     """Delete a single sample from the database and remove its image file."""
     try:
-        deleted_count, _ = delete_samples([sample_id])
+        deleted_count, _ = delete_samples([sample_id], db_path=db.DEFAULT_DB_PATH)
         if deleted_count == 0:
             raise HTTPException(
                 status_code=status.HTTP_404_NOT_FOUND,
@@ -635,7 +743,7 @@ def batch_delete_samples(payload: BatchDeleteRequest) -> dict[str, Any]:
         if not payload.ids:
             return {"status": "success", "deleted_count": 0, "deleted_ids": []}
 
-        deleted_count, _ = delete_samples(payload.ids)
+        deleted_count, _ = delete_samples(payload.ids, db_path=db.DEFAULT_DB_PATH)
         preview_ids = str(payload.ids[:8]) + ("..." if len(payload.ids) > 8 else "")
         add_activity_log(
             "INFO",
@@ -660,7 +768,7 @@ def batch_delete_samples(payload: BatchDeleteRequest) -> dict[str, Any]:
 def get_metrics() -> dict[str, Any]:
     """Return dataset statistics, class balance, and active model metrics."""
     try:
-        statistics = get_dataset_statistics()
+        statistics = get_dataset_statistics(db_path=db.DEFAULT_DB_PATH)
         model_data = load_classifier()
 
         if model_data is not None:
@@ -675,7 +783,7 @@ def get_metrics() -> dict[str, Any]:
             cold_baselines = None
             if statistics.get("positive_count", 0) >= 1 and statistics.get("negative_count", 0) >= 1:
                 try:
-                    X, y = load_training_matrix()
+                    X, y = load_training_matrix(db_path=db.DEFAULT_DB_PATH)
                     if len(y) > 0 and np.sum(y == 1) > 0:
                         from backend.model import DEFAULT_ZERO_SHOT_PROMPT, extract_text_embedding
                         from sklearn.metrics import precision_recall_curve, auc
@@ -730,7 +838,7 @@ def get_embeddings_scatter(
 ) -> dict[str, Any]:
     """Extract 2D coordinates for dataset sample embeddings using PCA or t-SNE."""
     try:
-        metadata, X = load_embedding_scatter_data()
+        metadata, X = load_embedding_scatter_data(db_path=db.DEFAULT_DB_PATH)
         total_points = len(metadata)
 
         if total_points == 0:
@@ -815,8 +923,8 @@ def get_embeddings_scatter(
 
 
 # Mount image store if directory exists
-if IMAGES_DIR.exists():
-    app.mount("/images", StaticFiles(directory=str(IMAGES_DIR)), name="images")
+if db.IMAGES_DIR.exists():
+    app.mount("/images", StaticFiles(directory=str(db.IMAGES_DIR)), name="images")
 
 # Mount static directory for developer dashboard if it exists
 if STATIC_DIR.exists():
