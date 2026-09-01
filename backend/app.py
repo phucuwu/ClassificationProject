@@ -9,7 +9,9 @@ from __future__ import annotations
 import base64
 import hashlib
 import io
+import json
 import os
+import threading
 import warnings
 from pathlib import Path
 from typing import Any
@@ -920,6 +922,127 @@ def get_embeddings_scatter(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail=f"Failed to generate embedding projection: {str(exc)}",
         ) from exc
+
+
+class BenchmarkRequest(BaseModel):
+    models: list[str] | None = None
+    limit: int | None = None
+    batch_size: int = 32
+    force_extract: bool = False
+
+
+_BENCHMARK_LOCK = threading.Lock()
+_BENCHMARK_STATE: dict[str, Any] = {
+    "status": "idle",
+    "percent": 0.0,
+    "current_model": None,
+    "processed_samples": 0,
+    "total_samples": 0,
+    "message": "No benchmark has been run yet.",
+    "results": None,
+    "updated_at": None,
+    "error": None,
+}
+
+
+def _run_benchmark_worker(
+    models: list[str] | None,
+    limit: int | None,
+    batch_size: int,
+    force_extract: bool,
+) -> None:
+    global _BENCHMARK_STATE
+    from tasks.benchmark_backbones import run_backbone_benchmark
+
+    def progress_cb(info: dict[str, Any]) -> None:
+        with _BENCHMARK_LOCK:
+            _BENCHMARK_STATE["status"] = info.get("status", "running")
+            _BENCHMARK_STATE["percent"] = info.get("percent", 0.0)
+            _BENCHMARK_STATE["current_model"] = info.get("current_model")
+            _BENCHMARK_STATE["processed_samples"] = info.get("processed_samples", 0)
+            _BENCHMARK_STATE["total_samples"] = info.get("total_samples", 0)
+            _BENCHMARK_STATE["message"] = info.get("message", "")
+            if "results" in info:
+                _BENCHMARK_STATE["results"] = info["results"]
+
+    try:
+        res = run_backbone_benchmark(
+            models=models,
+            limit=limit,
+            batch_size=batch_size,
+            force_extract=force_extract,
+            progress_callback=progress_cb,
+        )
+        with _BENCHMARK_LOCK:
+            _BENCHMARK_STATE["status"] = "completed"
+            _BENCHMARK_STATE["percent"] = 100.0
+            _BENCHMARK_STATE["current_model"] = None
+            _BENCHMARK_STATE["message"] = "Benchmark completed successfully."
+            _BENCHMARK_STATE["results"] = res.get("results", [])
+            _BENCHMARK_STATE["updated_at"] = res.get("timestamp")
+            _BENCHMARK_STATE["total_duration_seconds"] = res.get("total_duration_seconds")
+            _BENCHMARK_STATE["sample_count"] = res.get("sample_count", 0)
+    except Exception as exc:
+        with _BENCHMARK_LOCK:
+            _BENCHMARK_STATE["status"] = "error"
+            _BENCHMARK_STATE["error"] = str(exc)
+            _BENCHMARK_STATE["message"] = f"Benchmark failed: {str(exc)}"
+
+
+@app.post("/api/benchmark")
+def start_backbone_benchmark(payload: BenchmarkRequest | None = None) -> dict[str, Any]:
+    """Start asynchronous vision backbone benchmark evaluation in the background."""
+    with _BENCHMARK_LOCK:
+        if _BENCHMARK_STATE.get("status") == "running":
+            return {
+                "status": "already_running",
+                "message": "A benchmark evaluation is already in progress.",
+                "state": _BENCHMARK_STATE,
+            }
+        _BENCHMARK_STATE["status"] = "running"
+        _BENCHMARK_STATE["percent"] = 0.0
+        _BENCHMARK_STATE["current_model"] = None
+        _BENCHMARK_STATE["error"] = None
+        _BENCHMARK_STATE["message"] = "Starting vision backbone benchmark..."
+
+    req = payload or BenchmarkRequest()
+    thread = threading.Thread(
+        target=_run_benchmark_worker,
+        args=(req.models, req.limit, req.batch_size, req.force_extract),
+        daemon=True,
+    )
+    thread.start()
+
+    return {
+        "status": "started",
+        "message": "Vision backbone benchmark started in background.",
+    }
+
+
+@app.get("/api/benchmark")
+def get_backbone_benchmark_status() -> dict[str, Any]:
+    """Retrieve status, live progress, and results of vision backbone benchmark."""
+    with _BENCHMARK_LOCK:
+        state_copy = dict(_BENCHMARK_STATE)
+
+    # If idle in this process, check if results file exists on disk from prior run
+    if state_copy["status"] == "idle" and state_copy["results"] is None:
+        cache_results = Path(PROJECT_ROOT) / "data" / "cache" / "backbone_benchmark_results.json"
+        if cache_results.exists():
+            try:
+                with open(cache_results, "r", encoding="utf-8") as f:
+                    cached = json.load(f)
+                state_copy["status"] = "completed"
+                state_copy["percent"] = 100.0
+                state_copy["results"] = cached.get("results", [])
+                state_copy["updated_at"] = cached.get("timestamp")
+                state_copy["total_duration_seconds"] = cached.get("total_duration_seconds")
+                state_copy["sample_count"] = cached.get("sample_count", 0)
+                state_copy["message"] = "Loaded cached benchmark results."
+            except Exception:
+                pass
+
+    return state_copy
 
 
 # Mount image store if directory exists

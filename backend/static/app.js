@@ -51,6 +51,7 @@ function initTabs() {
         });
       } else if (activeTab === "tab-model") {
         fetchMetrics();
+        fetchBenchmarkStatus();
       } else if (activeTab === "tab-console") {
         fetchConsoleLogs();
       }
@@ -105,6 +106,9 @@ function initEventListeners() {
   if (retrainBtn) {
     retrainBtn.addEventListener("click", handleRetrainModel);
   }
+
+  // Vision Backbone Benchmark Controls
+  initBenchmarkEventListeners();
 
   // Threshold Slider
   const thresholdSlider = document.getElementById("slider-threshold");
@@ -326,6 +330,7 @@ function handleGlobalKeydown(e) {
 async function refreshAllData() {
   await fetchMetrics();
   await fetchReviewQueue();
+  fetchBenchmarkStatus();
 }
 
 async function fetchMetrics() {
@@ -1922,6 +1927,221 @@ async function handleInspectorDeleteSample() {
   } catch (err) {
     console.error("Error deleting sample from inspector:", err);
     showToast("Failed to delete sample", true);
+  }
+}
+
+// ----------------------------------------------------------------------------
+// Vision Backbone Benchmark Studio (Phase 10)
+// ----------------------------------------------------------------------------
+
+let benchmarkPollTimer = null;
+
+function initBenchmarkEventListeners() {
+  const runBtn = document.getElementById("btn-run-benchmark");
+  if (runBtn) {
+    runBtn.addEventListener("click", handleRunBenchmark);
+  }
+}
+
+async function handleRunBenchmark() {
+  const chkClip = document.getElementById("chk-bb-clip");
+  const chkSiglip = document.getElementById("chk-bb-siglip");
+  const chkDinov2 = document.getElementById("chk-bb-dinov2");
+
+  const selectedModels = [];
+  if (chkClip && chkClip.checked) selectedModels.push("clip-ViT-L-14");
+  if (chkSiglip && chkSiglip.checked) selectedModels.push("google/siglip-so400m-patch14-384");
+  if (chkDinov2 && chkDinov2.checked) selectedModels.push("facebook/dinov2-base");
+
+  if (selectedModels.length === 0) {
+    showToast("Please select at least one candidate backbone", true);
+    return;
+  }
+
+  setBenchmarkRunningState(true);
+
+  try {
+    const res = await fetch("/api/benchmark", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ models: selectedModels }),
+    });
+
+    if (!res.ok) throw new Error("Failed to start backbone benchmark");
+    const data = await res.json();
+
+    if (data.status === "already_running") {
+      showToast("A benchmark is already in progress");
+    } else {
+      showToast("Vision backbone benchmark started");
+    }
+
+    startBenchmarkPolling();
+  } catch (err) {
+    console.error("Error triggering benchmark:", err);
+    showToast("Failed to start benchmark", true);
+    setBenchmarkRunningState(false);
+  }
+}
+
+function startBenchmarkPolling() {
+  if (benchmarkPollTimer) clearInterval(benchmarkPollTimer);
+  fetchBenchmarkStatus();
+  benchmarkPollTimer = setInterval(async () => {
+    const status = await fetchBenchmarkStatus();
+    if (status !== "running") {
+      clearInterval(benchmarkPollTimer);
+      benchmarkPollTimer = null;
+    }
+  }, 1500);
+}
+
+async function fetchBenchmarkStatus() {
+  try {
+    const res = await fetch("/api/benchmark");
+    if (!res.ok) return "error";
+    const data = await res.json();
+
+    const statusBadge = document.getElementById("benchmark-status-badge");
+    const timestampText = document.getElementById("benchmark-timestamp-text");
+    const progressContainer = document.getElementById("benchmark-progress-container");
+    const progressMsg = document.getElementById("benchmark-progress-msg");
+    const progressPct = document.getElementById("benchmark-progress-pct");
+    const progressFill = document.getElementById("benchmark-progress-fill");
+
+    const status = data.status || "idle";
+
+    if (statusBadge) {
+      statusBadge.textContent = status.charAt(0).toUpperCase() + status.slice(1);
+      statusBadge.className = "status-badge";
+      if (status === "completed") statusBadge.classList.add("status-completed");
+      else if (status === "running") statusBadge.classList.add("status-training");
+      else if (status === "error") statusBadge.classList.add("status-error");
+    }
+
+    if (data.updated_at && timestampText) {
+      try {
+        const d = new Date(data.updated_at);
+        timestampText.textContent = `Last run: ${d.toLocaleTimeString()}`;
+      } catch {
+        timestampText.textContent = "";
+      }
+    }
+
+    if (status === "running") {
+      setBenchmarkRunningState(true);
+      if (progressContainer) progressContainer.classList.remove("hidden");
+      const pctVal = parseFloat(data.percent || 0).toFixed(1);
+      if (progressPct) progressPct.textContent = `${pctVal}%`;
+      if (progressFill) progressFill.style.width = `${pctVal}%`;
+      if (progressMsg) progressMsg.textContent = data.message || "Evaluating backbones...";
+      if (!benchmarkPollTimer) {
+        startBenchmarkPolling();
+      }
+    } else {
+      setBenchmarkRunningState(false);
+      if (progressContainer) progressContainer.classList.add("hidden");
+      if (data.results && data.results.length > 0) {
+        renderBenchmarkResults(data.results, data.total_duration_seconds);
+      }
+    }
+
+    return status;
+  } catch (err) {
+    console.error("Error fetching benchmark status:", err);
+    return "error";
+  }
+}
+
+function setBenchmarkRunningState(isRunning) {
+  const runBtn = document.getElementById("btn-run-benchmark");
+  const spinner = document.getElementById("benchmark-spinner");
+  const btnText = document.getElementById("benchmark-btn-text");
+
+  if (runBtn) runBtn.disabled = isRunning;
+  if (spinner) {
+    if (isRunning) spinner.classList.remove("hidden");
+    else spinner.classList.add("hidden");
+  }
+  if (btnText) {
+    btnText.textContent = isRunning ? "Benchmarking Backbones..." : "⚡ Run Backbone Benchmark";
+  }
+}
+
+function renderBenchmarkResults(results, totalDuration) {
+  const emptyState = document.getElementById("benchmark-empty-state");
+  const tableWrapper = document.getElementById("benchmark-results-wrapper");
+  const tableBody = document.getElementById("benchmark-table-body");
+  const summaryBox = document.getElementById("benchmark-summary-box");
+
+  if (!results || results.length === 0) {
+    if (emptyState) emptyState.classList.remove("hidden");
+    if (tableWrapper) tableWrapper.classList.add("hidden");
+    if (summaryBox) summaryBox.classList.add("hidden");
+    return;
+  }
+
+  if (emptyState) emptyState.classList.add("hidden");
+  if (tableWrapper) tableWrapper.classList.remove("hidden");
+  if (!tableBody) return;
+
+  tableBody.innerHTML = "";
+
+  let winnerModel = null;
+  let baselinePrauc = 0;
+
+  results.forEach((r) => {
+    if (r.is_baseline && r.metrics && r.metrics.pr_auc) {
+      baselinePrauc = r.metrics.pr_auc;
+    }
+    if (r.is_winner) {
+      winnerModel = r;
+    }
+
+    const tr = document.createElement("tr");
+    if (r.is_winner) tr.classList.add("row-winner");
+
+    const m = r.metrics || {};
+    const hasError = !!m.error;
+
+    const prAucDisplay = hasError ? "ERR" : (m.pr_auc !== undefined ? m.pr_auc.toFixed(4) : "-");
+    const f2Display = hasError ? "-" : (m.f2_score !== undefined ? m.f2_score.toFixed(4) : "-");
+    const recDisplay = hasError ? "-" : (m.recall !== undefined ? `${(m.recall * 100).toFixed(1)}%` : "-");
+    const precDisplay = hasError ? "-" : (m.precision !== undefined ? `${(m.precision * 100).toFixed(1)}%` : "-");
+    const bestC = m.best_c !== undefined ? m.best_c : "-";
+    const bestW = m.best_class_weight !== undefined ? m.best_class_weight : "-";
+    const speed = r.samples_per_second ? `${r.samples_per_second} samples/sec` : (r.extraction_duration_seconds === 0 ? "Cached" : `${r.extraction_duration_seconds}s`);
+
+    let nameHtml = r.model_name;
+    if (r.is_winner) {
+      nameHtml = `<div class="winner-badge-cell"><span>${r.model_name}</span><span class="winner-pill-tag">Top Performer</span></div>`;
+    }
+
+    tr.innerHTML = `
+      <td>${nameHtml}</td>
+      <td><code>${r.embedding_dim}</code></td>
+      <td class="${!hasError ? 'metric-highlight' : ''}">${prAucDisplay}</td>
+      <td class="${!hasError ? 'metric-highlight' : ''}">${f2Display}</td>
+      <td>${recDisplay}</td>
+      <td>${precDisplay}</td>
+      <td><code>${bestC}</code></td>
+      <td><code>${bestW}</code></td>
+      <td>${speed}</td>
+    `;
+    tableBody.appendChild(tr);
+  });
+
+  if (summaryBox && winnerModel && winnerModel.metrics && winnerModel.metrics.pr_auc) {
+    summaryBox.classList.remove("hidden");
+    const winnerPrauc = winnerModel.metrics.pr_auc;
+    const delta = winnerPrauc - baselinePrauc;
+    const deltaText = delta >= 0 ? `+${delta.toFixed(4)}` : `${delta.toFixed(4)}`;
+
+    summaryBox.innerHTML = `
+      <strong>Benchmark Summary:</strong>
+      <code>${winnerModel.model_name}</code> achieved the highest PR-AUC (${winnerPrauc.toFixed(4)}, F₂: ${winnerModel.metrics.f2_score.toFixed(4)}) across stratified 5-fold cross-validation
+      (${deltaText} vs baseline). Evaluated on ${winnerModel.sample_count} labeled samples${totalDuration ? ` in ${totalDuration}s` : ""}.
+    `;
   }
 }
 

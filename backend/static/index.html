@@ -486,6 +486,93 @@
             </div>
           </div>
         </div>
+
+        <!-- Vision Backbone Benchmark Studio -->
+        <div class="metric-card benchmark-studio-card" style="margin-top: 1.5rem;">
+          <div class="card-header-flex">
+            <div>
+              <h3>Vision Backbone Benchmark</h3>
+              <p class="subtext">Offline evaluation comparing candidate vision backbones against baseline CLIP using Stratified 5-Fold Cross-Validation.</p>
+            </div>
+            <div class="benchmark-header-meta">
+              <span class="status-badge" id="benchmark-status-badge">Idle</span>
+              <span class="benchmark-timestamp-text" id="benchmark-timestamp-text"></span>
+            </div>
+          </div>
+
+          <!-- Backbone Selection & Trigger Bar -->
+          <div class="benchmark-toolbar-box">
+            <div class="backbone-selection-area">
+              <span class="toolbar-label">Candidate Models:</span>
+              <div class="checkbox-chips-wrap">
+                <label class="checkbox-chip-item">
+                  <input type="checkbox" id="chk-bb-clip" value="clip-ViT-L-14" checked>
+                  <span class="chip-label">CLIP ViT-L/14 (Baseline)</span>
+                </label>
+                <label class="checkbox-chip-item">
+                  <input type="checkbox" id="chk-bb-siglip" value="google/siglip-so400m-patch14-384" checked>
+                  <span class="chip-label">Google SigLIP SO400M (384px)</span>
+                </label>
+                <label class="checkbox-chip-item">
+                  <input type="checkbox" id="chk-bb-dinov2" value="facebook/dinov2-base" checked>
+                  <span class="chip-label">Meta DINOv2 Base (768px)</span>
+                </label>
+              </div>
+            </div>
+
+            <div class="benchmark-actions-area">
+              <button id="btn-run-benchmark" class="btn btn-primary btn-benchmark-action">
+                <span class="btn-spinner hidden" id="benchmark-spinner"></span>
+                <span id="benchmark-btn-text">⚡ Run Backbone Benchmark</span>
+              </button>
+            </div>
+          </div>
+
+          <!-- Progress Bar (Visible while running) -->
+          <div id="benchmark-progress-container" class="benchmark-progress-box hidden">
+            <div class="progress-info-row">
+              <span id="benchmark-progress-msg">Preparing benchmark evaluation...</span>
+              <span id="benchmark-progress-pct">0.0%</span>
+            </div>
+            <div class="progress-track">
+              <div id="benchmark-progress-fill" class="progress-fill" style="width: 0%;"></div>
+            </div>
+          </div>
+
+          <!-- Benchmark Results Comparison Table -->
+          <div id="benchmark-table-container" class="benchmark-table-wrap">
+            <div class="table-empty-state" id="benchmark-empty-state">
+              <div class="empty-icon">🔬</div>
+              <p>No benchmark results available yet. Select backbones above and click <strong>Run Backbone Benchmark</strong>.</p>
+            </div>
+
+            <div class="table-responsive-container hidden" id="benchmark-results-wrapper">
+              <table class="benchmark-modern-table" id="benchmark-results-table">
+                <thead>
+                  <tr>
+                    <th>Backbone Model</th>
+                    <th>Dim</th>
+                    <th>PR-AUC</th>
+                    <th>F₂ Score</th>
+                    <th>Recall</th>
+                    <th>Precision</th>
+                    <th>Best C</th>
+                    <th>Weight Config</th>
+                    <th>Extraction Speed</th>
+                  </tr>
+                </thead>
+                <tbody id="benchmark-table-body">
+                  <!-- Dynamically populated rows -->
+                </tbody>
+              </table>
+            </div>
+          </div>
+
+          <!-- Benchmark Summary Box -->
+          <div id="benchmark-summary-box" class="benchmark-summary-alert hidden">
+            <!-- Dynamically populated recommendation -->
+          </div>
+        </div>
       </section>
 
       <!-- View 4: Live Console / Activity Log -->

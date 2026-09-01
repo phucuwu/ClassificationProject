@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import base64
 import io
+import json
 import os
 import pickle
 import warnings
@@ -30,7 +31,8 @@ from sklearn.model_selection import StratifiedKFold, train_test_split
 # Default file paths
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 DATA_DIR = PROJECT_ROOT / "data"
-MODEL_PATH = DATA_DIR / "model.pkl"
+MODEL_PATH = DATA_DIR / "model.json"
+LEGACY_MODEL_PATH = DATA_DIR / "model.pkl"
 
 # Model architecture settings
 CLIP_MODEL_NAME = "clip-ViT-L-14"
@@ -546,8 +548,7 @@ def train_taste_classifier(
         "reference_type": ref_type,
         "reference_source": ref_source,
     }
-    with open(actual_model_path, "wb") as f:
-        pickle.dump(model_payload, f)
+    save_classifier_json(model_payload, actual_model_path)
 
     return {
         "status": "trained",
@@ -556,6 +557,73 @@ def train_taste_classifier(
         "negative_count": negative_count,
         "metrics": metrics,
     }
+
+
+def save_classifier_json(payload: dict[str, Any], target_path: Path | str) -> None:
+    """Save trained taste classifier model artifact to disk in structured JSON format.
+
+    Uses atomic file replacement to prevent corrupted files if interrupted.
+    """
+    actual_path = Path(target_path)
+    actual_path.parent.mkdir(parents=True, exist_ok=True)
+
+    clf = payload.get("classifier")
+    coefficients = payload.get("coefficients")
+    intercept = payload.get("intercept")
+    classes = payload.get("classes", [0, 1])
+
+    if clf is not None:
+        if hasattr(clf, "coef_"):
+            coefficients = clf.coef_.tolist()
+        if hasattr(clf, "intercept_"):
+            intercept = clf.intercept_.tolist()
+        if hasattr(clf, "classes_"):
+            classes = clf.classes_.tolist()
+
+    oof_probs = payload.get("oof_probabilities", [])
+    if isinstance(oof_probs, np.ndarray):
+        oof_probs = oof_probs.tolist()
+
+    y_oof = payload.get("y_oof", [])
+    if isinstance(y_oof, np.ndarray):
+        y_oof = y_oof.tolist()
+
+    ref_emb = payload.get("reference_embedding")
+    if isinstance(ref_emb, np.ndarray):
+        ref_emb = ref_emb.tolist()
+
+    serializable = {
+        "format_version": "1.0",
+        "coefficients": coefficients,
+        "intercept": intercept,
+        "classes": classes,
+        "decision_threshold": float(payload.get("decision_threshold", DEFAULT_DECISION_THRESHOLD)),
+        "metrics": payload.get("metrics", {}),
+        "sample_count": int(payload.get("sample_count", 0)),
+        "positive_count": int(payload.get("positive_count", 0)),
+        "negative_count": int(payload.get("negative_count", 0)),
+        "oof_probabilities": oof_probs,
+        "y_oof": y_oof,
+        "oof_score_map": {str(k): float(v) for k, v in payload.get("oof_score_map", {}).items()},
+        "reference_embedding": ref_emb,
+        "reference_type": payload.get("reference_type", "text"),
+        "reference_source": payload.get("reference_source", DEFAULT_ZERO_SHOT_PROMPT),
+    }
+
+    # Atomic write to temporary file then replace
+    tmp_path = actual_path.with_suffix(actual_path.suffix + ".tmp")
+    with open(tmp_path, "w", encoding="utf-8") as f:
+        json.dump(serializable, f, indent=2)
+    tmp_path.replace(actual_path)
+
+    # If saving to .pkl (for backwards compatibility with callers specifying .pkl), also save .json sibling
+    if actual_path.suffix.lower() == ".pkl":
+        json_sibling = actual_path.with_suffix(".json")
+        try:
+            with open(json_sibling, "w", encoding="utf-8") as f:
+                json.dump(serializable, f, indent=2)
+        except Exception:
+            pass
 
 
 def update_decision_threshold(
@@ -570,7 +638,7 @@ def update_decision_threshold(
 
     Args:
         new_threshold: New probability cutoff value between 0.05 and 0.95.
-        model_path: Destination path for saved model pickle file.
+        model_path: Destination path for saved model JSON or pickle file.
         db_path: Optional SQLite database file path.
 
     Returns:
@@ -642,8 +710,7 @@ def update_decision_threshold(
     model_data["decision_threshold"] = clamped_threshold
     model_data["metrics"] = metrics
 
-    with open(actual_model_path, "wb") as f:
-        pickle.dump(model_data, f)
+    save_classifier_json(model_data, actual_model_path)
 
     return {
         "success": True,
@@ -653,13 +720,79 @@ def update_decision_threshold(
 
 
 def load_classifier(model_path: Path | str | None = None) -> dict[str, Any] | None:
-    """Load the trained taste classifier from disk if available."""
-    actual_model_path = Path(model_path) if model_path is not None else Path(MODEL_PATH)
-    if not actual_model_path.exists():
+    """Load the trained taste classifier from disk.
+
+    Supports structured JSON artifacts and automatically migrates legacy pickle files.
+    """
+    if model_path is not None:
+        p = Path(model_path)
+        candidates = [p]
+        if p.suffix.lower() == ".pkl":
+            candidates.insert(0, p.with_suffix(".json"))
+        elif p.suffix.lower() == ".json":
+            candidates.append(p.with_suffix(".pkl"))
+    else:
+        p = Path(MODEL_PATH)
+        candidates = [p]
+        if p.suffix.lower() == ".json":
+            candidates.append(p.with_suffix(".pkl"))
+        elif p.suffix.lower() == ".pkl":
+            candidates.insert(0, p.with_suffix(".json"))
+
+    target_file = None
+    for cand in candidates:
+        if cand.exists():
+            target_file = cand
+            break
+
+    if target_file is None:
         return None
+
+    # 1. Try loading structured JSON artifact
     try:
-        with open(actual_model_path, "rb") as f:
-            return pickle.load(f)
+        with open(target_file, "r", encoding="utf-8") as f:
+            data = json.load(f)
+
+        if isinstance(data, dict) and "coefficients" in data:
+            # Restore oof_score_map keys as integer sample IDs
+            if "oof_score_map" in data and isinstance(data["oof_score_map"], dict):
+                data["oof_score_map"] = {
+                    int(k): float(v)
+                    for k, v in data["oof_score_map"].items()
+                    if k.isdigit() or (k.startswith("-") and k[1:].isdigit())
+                }
+
+            # Reconstruct scikit-learn classifier object for callers relying on classifier API
+            coef = data.get("coefficients")
+            intercept = data.get("intercept")
+            if coef is not None and intercept is not None:
+                clf = LogisticRegression()
+                clf.coef_ = np.array(coef, dtype=np.float32)
+                clf.intercept_ = np.array(intercept, dtype=np.float32)
+                clf.classes_ = np.array(data.get("classes", [0, 1]), dtype=np.int32)
+                data["classifier"] = clf
+            else:
+                data["classifier"] = None
+
+            return data
+    except (json.JSONDecodeError, UnicodeDecodeError):
+        pass
+    except Exception:
+        pass
+
+    # 2. Fallback: load legacy pickle and auto-migrate to structured JSON
+    try:
+        with open(target_file, "rb") as f:
+            legacy_data = pickle.load(f)
+
+        if isinstance(legacy_data, dict):
+            json_dest = target_file.with_suffix(".json") if target_file.suffix.lower() == ".pkl" else MODEL_PATH
+            try:
+                save_classifier_json(legacy_data, json_dest)
+            except Exception:
+                pass
+
+        return legacy_data
     except Exception:
         return None
 
@@ -670,6 +803,9 @@ def predict_taste(
     model_path: Path | str | None = None,
 ) -> dict[str, Any]:
     """Calculate prediction score and binary decision for a single vision embedding.
+
+    Uses direct NumPy vectorized inference on serialized coefficients and intercept,
+    removing runtime scikit-learn dependency.
 
     Args:
         embedding: 768-dimensional float32 vision embedding.
@@ -690,15 +826,32 @@ def predict_taste(
             "message": "Model not trained yet. Gather samples in Manual Mode first.",
         }
 
-    classifier: LogisticRegression = model_data["classifier"]
-    active_threshold = threshold if threshold is not None else model_data.get("decision_threshold", DEFAULT_DECISION_THRESHOLD)
+    active_threshold = threshold if threshold is not None else float(model_data.get("decision_threshold", DEFAULT_DECISION_THRESHOLD))
 
     # Ensure embedding is 2D with shape (1, 768)
     if embedding.ndim == 1:
         embedding = embedding.reshape(1, -1)
 
-    # Calculate probability P(Like)
-    prob_like = float(classifier.predict_proba(embedding)[0, 1])
+    coef = model_data.get("coefficients")
+    intercept = model_data.get("intercept")
+
+    if coef is not None and intercept is not None:
+        coef_arr = np.asarray(coef, dtype=np.float32)
+        intercept_arr = np.asarray(intercept, dtype=np.float32)
+        logit = float(np.dot(embedding, coef_arr.T).item() + intercept_arr.item())
+        prob_like = float(1.0 / (1.0 + np.exp(-logit)))
+    elif model_data.get("classifier") is not None:
+        classifier: LogisticRegression = model_data["classifier"]
+        prob_like = float(classifier.predict_proba(embedding)[0, 1])
+    else:
+        return {
+            "prediction_score": None,
+            "decision": None,
+            "threshold": None,
+            "model_loaded": False,
+            "message": "Model weights unavailable.",
+        }
+
     decision = 1 if prob_like >= active_threshold else 0
 
     return {
