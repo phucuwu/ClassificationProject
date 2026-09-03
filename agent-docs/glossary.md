@@ -28,6 +28,10 @@ This glossary defines standard terminology used across the backend, userscript, 
 * **Precision**: The proportion of predicted likes that are true likes: $\frac{\text{TP}}{\text{TP} + \text{FP}}$.
 * **PR-AUC**: The area under the Precision-Recall curve. The primary evaluation metric for model training on this imbalanced dataset.
 * **$F_2$ score**: An evaluation metric that weights recall twice as heavily as precision: $\frac{5 \cdot \text{Precision} \cdot \text{Recall}}{4 \cdot \text{Precision} + \text{Recall}}$.
+* **Near-duplicate detection**: Pairwise cosine similarity comparison identifying when an incoming artwork embedding is visually identical or nearly identical (similarity $\ge 0.98$) to an existing sample in the dataset database.
+* **Outlier detection**: Distance and score analysis flagging ratings that contradict established clusters in feature space (distance $> 2\sigma$ from class centroid or out-of-fold score inconsistent with assigned label).
+* **Session drift**: Deviation in rating distribution over a rolling window of recent samples, flagging when the positive class ratio strays outside the expected 5% to 10% baseline range.
+* **Backbone benchmark**: An evaluation engine that scores alternative pretrained vision models (such as SigLIP and DINOv2) against baseline CLIP on cross-validated PR-AUC and $F_2$ metrics.
 
 ---
 
@@ -49,4 +53,3 @@ This glossary defines standard terminology used across the backend, userscript, 
 * **Dataset database**: The local SQLite database file at `data/dataset.db` running in WAL mode, storing sample metadata, binary labels, prediction scores, and embedding BLOBs.
 * **PCA (Principal Component Analysis)**: A linear dimensionality reduction technique that projects 768-dimensional vision embeddings onto the 2 orthogonal axes of highest variance while preserving global dataset structure.
 * **t-SNE (t-Distributed Stochastic Neighbor Embedding)**: A non-linear manifold learning technique that projects 768-dimensional vision embeddings into 2D coordinates while preserving local neighborhood similarities and revealing aesthetic sub-clusters.
-

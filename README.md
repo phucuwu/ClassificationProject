@@ -124,14 +124,19 @@ The backend server exposes the following HTTP JSON endpoints:
 
 | Endpoint | Method | Description |
 | :--- | :--- | :--- |
-| `/api/record` | `POST` | Ingests a sample with a base64 image, label, and operating mode. Extracts and saves the vision embedding. |
+| `/api/record` | `POST` | Ingests a sample with a base64 image, label, and operating mode. Extracts and saves the vision embedding. Consolidates near-duplicates. |
 | `/api/predict` | `POST` | Computes the vision embedding for a base64 image and returns the prediction score and binary decision. |
 | `/api/capture` | `POST` | Captures an OS desktop screen region when the browser DOM cannot access raw image bytes. |
 | `/api/train` | `POST` | Trains the Logistic Regression model on all labeled samples in the database and returns evaluation metrics. |
-| `/api/samples` | `GET` | Queries stored samples for dashboard inspection and review, with base64 images included. |
+| `/api/threshold` | `POST` | Updates the active decision threshold in the model artifact and recalculates evaluation metrics. |
+| `/api/samples` | `GET` | Queries stored samples for dashboard inspection and review, with outlier filtering. |
+| `/api/samples/{id}` | `DELETE` | Deletes a single sample and its stored image file. |
+| `/api/samples/batch-delete` | `POST` | Deletes multiple samples and their images in a single transaction. |
 | `/api/embeddings/scatter` | `GET` | Computes 2D PCA or t-SNE coordinates for all sample embeddings for interactive scatter visualization. |
 | `/api/review` | `POST` | Applies batch label updates and marks samples as reviewed. |
 | `/api/metrics` | `GET` | Returns dataset distribution, confusion matrix data, and PR curves across candidate thresholds. |
+| `/api/benchmark` | `POST` | Starts asynchronous vision backbone benchmark evaluation in the background. |
+| `/api/benchmark` | `GET` | Queries live progress and evaluation metrics of the vision backbone benchmark. |
 | `/api/logs` | `GET` | Retrieves real-time interaction logs for manual ratings, predictions, auto actions, and training events. |
 | `/api/logs/clear` | `POST` | Clears all activity console logs. |
 
@@ -152,13 +157,17 @@ ClassificationProject/
 │       ├── index.html
 │       └── style.css
 ├── data/
+│   ├── cache/                     # Cached benchmark and computation outputs
 │   ├── dataset.db                 # SQLite dataset database (WAL mode)
 │   ├── images/                    # Local cache of primary image files
-│   └── model.pkl                  # Serialized classification model
+│   └── model.json                 # Serialized model weights and evaluation metrics
 ├── tasks/
+│   ├── benchmark_backbones.py     # Vision backbone benchmark engine
 │   └── todo.md                    # Project roadmap and checklist
+├── tests/                         # Automated test suites
 ├── userscript/
 │   └── taste_collector.user.js    # Tampermonkey browser script
 ├── requirements.txt               # Python package dependencies
 └── README.md                      # Project documentation
 ```
+

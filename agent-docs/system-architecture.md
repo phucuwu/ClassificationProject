@@ -1,69 +1,84 @@
-# System Architecture Specification: Art Taste Classifier
+# System architecture specification: Art taste classifier
 
-This document defines the complete architecture for the local binary art taste classification system.
+This document defines the architecture for the local binary art taste classification system.
 
 ---
 
-## 1. System Overview
+## 1. System overview
 
 The system consists of two primary components:
-1. **Local Backend Server (FastAPI + SQLite + PyTorch/CLIP + scikit-learn):**
+
+1. **Local backend server (FastAPI, SQLite, PyTorch, CLIP, scikit-learn):**
    * Manages dataset storage, image processing, embedding extraction, model training, and prediction serving.
-   * Serves an interactive developer dashboard for reviewing automated decisions, tuning classification thresholds, and monitoring evaluation metrics.
-2. **Browser Layer (Tampermonkey Userscript):**
-   * Injects into the art library website.
+   * Serves an interactive developer dashboard for reviewing automated decisions, tuning classification thresholds, exploring embedding projections, and monitoring evaluation metrics.
+2. **Browser layer (Tampermonkey userscript):**
+   * Injects into the target art library website.
    * Extracts the primary image from each artwork set.
-   * Supports three operating modes: **Manual Recording**, **Supervised Auto**, and **Full Auto**.
-   * Dispatches native keyboard events (Left Arrow for Dislike, Right Arrow for Like) to trigger website actions.
+   * Supports three operating modes: manual mode, supervised mode, and full auto mode.
+   * Dispatches keyboard events (Left Arrow for Dislike, Right Arrow for Like) to trigger website rating actions.
 
 ```
 +--------------------------------------------------------------------+
-|                       Art Library Website                          |
+|                         Art library website                        |
 |  +--------------------------------------------------------------+  |
-|  |                 Tampermonkey Userscript                      |  |
-|  |  - Hotkey Handler (Left Arrow / Right Arrow / S / A)         |  |
-|  |  - Image Extractor (DOM -> Canvas -> /api/capture)           |  |
-|  |  - UI Overlay (Supervised predictions & threshold preview)   |  |
-|  |  - Keyboard Simulator (Left/Right Arrow triggers)            |  |
+|  |                    Tampermonkey userscript                   |  |
+|  |  - Hotkey handler (Left Arrow, Right Arrow, S, A)            |  |
+|  |  - Image extractor (DOM -> Canvas -> /api/capture)           |  |
+|  |  - UI overlay (Supervised predictions & threshold preview)   |  |
+|  |  - Keyboard simulator (Left/Right Arrow triggers)            |  |
 |  +------------------------------+-------------------------------+  |
 +---------------------------------|----------------------------------+
                                   | HTTP (GM_xmlhttpRequest JSON)
                                   v
 +--------------------------------------------------------------------+
-|                    Local Backend (FastAPI :8000)                   |
+|                    Local backend (FastAPI :8000)                   |
 |                                                                    |
 |  +--------------------------------------------------------------+  |
-|  | API Endpoints                                                |  |
-|  |  - POST /api/record   (Saves sample, image, embedding)       |  |
-|  |  - POST /api/predict  (Computes embedding & returns score)   |  |
-|  |  - POST /api/capture  (Desktop screenshot fallback)          |  |
-|  |  - POST /api/train    (Fits Logistic Regression & evaluates) |  |
-|  |  - GET  /api/samples  (Queries dataset with embedded base64) |  |
-|  |  - POST /api/review   (Bulk update labels & review status)   |  |
-|  |  - GET  /api/metrics  (PR-AUC, Recall@Threshold, Confusion)  |  |
+|  | API endpoints                                                |  |
+|  |  - POST   /api/record   (Saves sample, image, embedding)     |  |
+|  |  - POST   /api/predict  (Computes embedding & returns score) |  |
+|  |  - POST   /api/capture  (Desktop screenshot fallback)        |  |
+|  |  - POST   /api/train    (Grid search CV & threshold tune)    |  |
+|  |  - POST   /api/threshold(Updates active decision threshold)  |  |
+|  |  - GET    /api/samples  (Queries dataset & outlier flags)   |  |
+|  |  - POST   /api/review   (Bulk update labels & review status) |  |
+|  |  - DELETE /api/samples/{id} (Single sample deletion)         |  |
+|  |  - POST   /api/samples/batch-delete (Batch sample deletion)  |  |
+|  |  - GET    /api/metrics  (PR-AUC, F2, confusion matrix)       |  |
+|  |  - GET    /api/embeddings/scatter (PCA & t-SNE 2D coords)    |  |
+|  |  - POST   /api/benchmark (Vision backbone benchmark run)     |  |
+|  |  - GET    /api/benchmark (Benchmark status & results)        |  |
+|  |  - GET    /api/logs     (Live activity console logs)         |  |
+|  |  - POST   /api/logs/clear (Clear console logs)               |  |
 |  +------------------------------+-------------------------------+  |
 |                                 |                                  |
 |  +---------------------+  +-----+---------------+  +------------+  |
 |  | Pretrained CLIP     |  | Logistic Regression |  | SQLite DB  |  |
-|  | (clip-ViT-L-14)     |  | (Balanced Weights)  |  | (WAL Mode) |  |
+|  | (clip-ViT-L-14)     |  | (JSON serialization)|  | (WAL mode) |  |
+|  | 768-dim float32     |  | data/model.json     |  | dataset.db |  |
 |  +---------------------+  +---------------------+  +------------+  |
 |                                                          |         |
 |  +---------------------------------------------------+   |         |
-|  | Developer Web Dashboard (HTML / Vanilla CSS / JS) |   |         |
-|  |  - Visual grid for reviewing Full Auto decisions  |<--+         |
-|  |  - Real-time PR curve, Recall slider & Retrain button           |
+|  | Developer web dashboard (HTML, Vanilla CSS, JS)   |   |         |
+|  |  - Review queue: Grid for Full Auto decisions     |<--+         |
+|  |  - Samples: Dataset inspector with outlier filter |             |
+|  |  - Embedding space: Interactive 2D scatter plot   |             |
+|  |  - Model & metrics: PR curve, threshold, retrain  |             |
+|  |  - Console: Real-time event log stream            |             |
 |  +-----------------------------------------------------------------+
 +--------------------------------------------------------------------+
 ```
 
 ---
 
-## 2. Storage & Database Schema
+## 2. Storage and database schema
 
-### Database Configuration
-* Engine: SQLite 3 with Write-Ahead Logging (`PRAGMA journal_mode=WAL;`).
-* Location: `data/dataset.db`
-* Raw Images: `data/images/{image_hash}.jpg`
+### File storage configuration
+* Engine: SQLite 3 with Write-Ahead Logging (`PRAGMA journal_mode = WAL;`) and synchronous mode normal (`PRAGMA synchronous = NORMAL;`).
+* Database location: `data/dataset.db`
+* Model weights location: `data/model.json` (stores coefficients, intercept, decision threshold, metrics, and reference baselines). The system also auto-migrates legacy `data/model.pkl` artifacts to JSON on load.
+* Stored artwork images: `data/images/{image_hash}.jpg`
+* Cache and benchmark outputs: `data/cache/backbone_benchmark_results.json`
 
 ### Table: `samples`
 | Column | Type | Description |
@@ -71,81 +86,111 @@ The system consists of two primary components:
 | `id` | `INTEGER PRIMARY KEY AUTOINCREMENT` | Unique identifier |
 | `image_hash` | `TEXT UNIQUE NOT NULL` | SHA-256 hash of image bytes to prevent duplicates |
 | `file_path` | `TEXT NOT NULL` | Relative path to local stored image |
-| `label` | `INTEGER` | `1` (Like), `0` (Dislike), `NULL` (Pending Review) |
-| `prediction_score` | `REAL` | Model predicted probability $P(\text{like})$ (0.0 to 1.0) |
+| `label` | `INTEGER` | `1` (Like), `0` (Dislike), `NULL` (Pending review) |
+| `prediction_score` | `REAL` | Model predicted probability $P(\text{Like})$ from 0.0 to 1.0 |
 | `mode` | `TEXT NOT NULL` | `'manual'`, `'supervised'`, `'auto'` |
-| `reviewed` | `INTEGER DEFAULT 0` | `1` = Confirmed by human, `0` = Unreviewed |
+| `reviewed` | `INTEGER DEFAULT 0` | `1` = Confirmed by human, `0` = Pending review |
 | `embedding` | `BLOB NOT NULL` | 768 `float32` vector bytes (3072 bytes) |
 | `created_at` | `TIMESTAMP DEFAULT CURRENT_TIMESTAMP` | Ingestion timestamp |
 
----
-
-## 3. Machine Learning & Training Pipeline
-
-### Embedding Model
-* **Model:** OpenAI CLIP (`clip-ViT-L-14`, 768 dimensions) via `sentence-transformers` or Hugging Face `transformers`.
-* Runs on CUDA if available, otherwise CPU.
-* Normalizes embeddings ($L_2$ norm = 1.0) for consistent cosine similarity.
-
-### Classifier
-* **Algorithm:** `LogisticRegression(class_weight='balanced', C=1.0, max_iter=1000)` from `scikit-learn`.
-* **Imbalance Handling:** Balanced class weights scale the penalty for the minority positive class (5-10% likes) proportionally to class frequency.
-* **Decision Threshold:** Configurable (default 0.35) to prioritize high Recall ($>90\%$) while keeping Precision acceptable.
-
-### Evaluation Metrics
-* **Precision-Recall AUC (PR-AUC):** Informative metric for skewed binary classes.
-* **F-beta Score ($F_2$):** Places twice the weight on Recall over Precision.
-* **Confusion Matrix:** True Positives, False Positives, True Negatives, False Negatives across candidate thresholds.
+### Indexes
+* `idx_samples_reviewed` on `samples(reviewed)`
+* `idx_samples_mode` on `samples(mode)`
+* `idx_samples_label` on `samples(label)`
+* `idx_samples_image_hash` on `samples(image_hash)`
 
 ---
 
-## 4. Operational Modes & Browser Integration
+## 3. Machine learning and data quality pipeline
 
-### Mode 1: Manual Recording
-1. User navigates art library.
+### Vision embedding model
+* Model: OpenAI CLIP (`clip-ViT-L-14`, 768 dimensions) loaded via `sentence-transformers`.
+* Compute device: CUDA GPU when available, otherwise CPU.
+* Normalization: Vectors are $L_2$-normalized to unit length for cosine distance operations.
+
+### Classifier and hyperparameter search
+* Model family: Balanced Logistic Regression using `scikit-learn`.
+* Grid search: Evaluates candidate regularization parameters $C \in [0.01, 0.1, 0.5, 1.0, 2.0, 5.0, 10.0]$ across four class weight multipliers (`balanced`, `unweighted`, `balanced_1.5x`, `balanced_2.0x`).
+* Validation: Stratified 5-Fold Cross-Validation on development data generates out-of-fold predictions. When positive samples are fewer than 5, fold count scales down to $\min(5, \text{pos}, \text{neg})$.
+* Ranking metric: Best hyperparameter configuration is selected by out-of-fold PR-AUC, breaking ties with average precision.
+* Final model fitting: Once parameters are selected, the final classifier fits on 100% of labeled samples.
+* Serialization: Model coefficients, intercept scalar, active decision threshold, evaluation metrics, and reference baselines serialize into `data/model.json`. Vectorized inference uses direct NumPy dot products without requiring scikit-learn unpickling.
+
+### Decision threshold calibration
+* Default threshold: $\theta = 0.35$ (calibrated below 0.50 to favor recall on skewed taste distributions).
+* Hybrid $F_2$ calibration: Searches thresholds from 0.05 to 0.95 in steps of 0.01 to maximize the $F_2$ score while enforcing a minimum recall floor (default 0.70).
+* Target recall calibration: When specified, finds the highest threshold that meets or exceeds the requested recall target.
+* Explicit manual override: Allows setting the active threshold directly via `POST /api/threshold` or `POST /api/train`.
+
+### Generalization verification
+* Holdout partition: Reserves the holdout fraction (default 15%) to verify out-of-fold generalization.
+* Divergence alert: If holdout PR-AUC drops by more than 0.25 below out-of-fold PR-AUC, the system records a generalization warning in model metadata and logs.
+
+### Reference baselines
+Every training run computes three reference baselines:
+1. **Random guess baseline:** Positive class ratio in development data.
+2. **Positive centroid baseline:** Cosine similarity against the average vector of all positive class embeddings.
+3. **Zero-shot prompt baseline:** Cosine similarity against a prompt text embedding (default: "goth aesthetic alternative indie girl style") or a custom user exemplar image embedding.
+
+### Data quality and consistency tooling
+* **Near-duplicate detection:** Calculates cosine similarity across existing vision embeddings on ingestion. If similarity is greater than or equal to 0.98, `POST /api/record` consolidates the incoming record into the existing sample row, updating labels without creating duplicate database rows or disk files.
+* **Positive class outlier detection:** Computes the positive class centroid in feature space. Flags samples whose distance from the centroid exceeds 2 standard deviations, or whose out-of-fold prediction score is below 0.20.
+* **Negative class outlier detection:** Flags negative samples whose distance from the negative centroid exceeds 2 standard deviations, or whose prediction score meets or exceeds the active decision threshold.
+* **Session drift monitoring:** Analyzes a rolling window of recent samples (default 100). Emits an activity log warning if the rolling positive ratio drops below 5% or rises above 10%.
+
+### Vision backbone benchmark suite
+Located in `tasks/benchmark_backbones.py` and exposed through `POST /api/benchmark`:
+* Evaluates alternative vision backbones against the baseline `clip-ViT-L-14` (768 dimensions), including Google SigLIP SO400M (`google/siglip-so400m-patch14-384`, 1152 dimensions) and Meta DINOv2 (`facebook/dinov2-base`, 768 dimensions).
+* Runs stratified cross-validation on extracted embeddings and persists comparative PR-AUC, $F_2$, recall, and precision to `data/cache/backbone_benchmark_results.json`.
+
+---
+
+## 4. Operating modes and browser integration
+
+### Mode 1: Manual mode
+1. User browses the library website and evaluates an artwork.
 2. User presses Left Arrow (Dislike) or Right Arrow (Like).
-3. Script locates the first image in the set, extracts base64 image data, and posts payload to `/api/record` with `label` (0 or 1) and `mode='manual'`.
-4. Script dispatches keyboard event (Left or Right arrow) to advance the library website.
+3. The userscript extracts the primary image from the active container as a base64 string.
+4. The userscript sends payload to `POST /api/record` with `label` (0 or 1), `mode = 'manual'`, and `reviewed = 1`.
+5. The userscript dispatches synthetic arrow key events to advance the library website.
 
-### Mode 2: Supervised Auto
-1. Script grabs the current first image and sends it to `/api/predict`.
-2. Backend computes CLIP embedding, runs Logistic Regression, and returns `prediction_score` (e.g. `0.78`).
-3. Script displays a floating on-screen badge showing the predicted decision and confidence.
-4. User presses hotkey to confirm (`Y`) or override (`N`).
-5. Script posts confirmed label to `/api/record` and simulates the corresponding arrow key.
+### Mode 2: Supervised mode
+1. The userscript extracts the primary image and posts to `POST /api/predict`.
+2. The backend server computes the vision embedding, runs vectorized logistic inference, and returns `prediction_score` and `decision`.
+3. The userscript renders a floating HUD badge displaying the predicted classification and confidence percentage.
+4. The user presses `Y` to accept the prediction, or `N` to flip and override the label.
+5. The userscript sends the confirmed label to `POST /api/record` with `mode = 'supervised'` and dispatches the corresponding arrow key.
 
-### Mode 3: Full Auto
-1. Script grabs the current first image and sends it to `/api/predict`.
-2. Backend returns probability score. Script compares against active threshold.
-3. Script dispatches the appropriate arrow key (Left or Right) to the website.
-4. Script posts record to `/api/record` with `mode='auto'` and `reviewed=0`.
-5. User reviews and adjusts auto-labeled records in bulk via the dashboard later.
-
----
-
-## 5. Web Developer Dashboard
-
-A clean local web interface served directly by FastAPI at `http://localhost:8000`:
-* **Overview Tab:** Summary cards (Total samples, Total Likes, Like Ratio, Model Status, Current PR-AUC).
-* **Review Queue Tab:** Grid view of unreviewed full-auto predictions. Review with mouse clicks to toggle badges or `1`/`0` keys on selected cards.
-* **Samples Tab:** Dataset inspector to browse, filter, and batch delete samples.
-* **Embedding Space Tab:** Interactive 2D scatter plot visualizer projecting the vision embedding space using PCA or t-SNE, with color coding by label or score and hover image previews.
-* **Model & Metrics Tab:** PR curve visualization, threshold slider showing dynamic Recall/Precision tradeoff, confusion matrix, and a "Retrain Model" button.
-* **Console Tab:** Real-time log stream of system and rating events.
+### Mode 3: Full auto mode
+1. The userscript extracts the primary image and requests a prediction from `POST /api/predict`.
+2. The userscript evaluates the score against the active decision threshold.
+3. The userscript simulates the appropriate arrow key action immediately.
+4. The userscript posts the record to `POST /api/record` with `mode = 'auto'`. All positive decisions enter the review queue (`reviewed = 0`). Dislikes are sampled at a configurable audit rate (default 5% set to `reviewed = 0`, remainder marked `reviewed = 1`).
+5. The user reviews and corrects automated decisions in bulk via the developer dashboard review queue.
 
 ---
 
-## 6. Embedding Space Visualizer & Dimensionality Reduction
+## 5. Web developer dashboard
 
-The developer dashboard includes an interactive 2D scatter plot to explore the 768-dimensional vision embedding space.
+The backend server serves a single-page dashboard at `http://localhost:8000`:
+
+* **Review queue tab:** Card grid showing automated decisions pending review (`reviewed = 0`). Users click cards or press `1`/`0` to toggle labels, and click "Mark All Visible as Reviewed" to confirm in bulk.
+* **Samples tab (Dataset inspector):** Filterable grid of all stored samples. Supports filtering by mode, label, and outlier quality status (inconsistent likes or dislikes). Includes select all, deselect, and batch deletion controls.
+* **Embedding space tab:** Hardware-accelerated 2D canvas visualization of the 768-dimensional vision embedding space using PCA or t-SNE projection. Includes cursor-centered zoom, pan, point color modes (by label or prediction score), thumbnail hover previews from `/images/{image_hash}.jpg`, and a slide-out sample inspection drawer.
+* **Model & metrics tab:** Visualizes out-of-fold Precision-Recall curves, a dynamic threshold tuning slider with quick preset chips, a confusion matrix table, zero-shot reference baseline controls, retrain trigger, and vision backbone benchmark controls.
+* **Console tab:** Real-time stream of system activity logs, manual ratings, predictions, near-duplicate consolidations, session drift alerts, and training events.
+
+---
+
+## 6. Embedding space visualizer and dimensionality reduction
 
 ```
 +-------------------------------------------------------------------------------+
-|                      Embedding Space Visualizer Architecture                  |
+|                      Embedding space visualizer architecture                  |
 |                                                                               |
 |   +-----------------------------------------------------------------------+   |
-|   | SQLite DB (`samples` table)                                            |   |
-|   |  - 768-dim L2-normalized float32 BLOBs + Sample Metadata              |   |
+|   | SQLite DB (`samples` table)                                           |   |
+|   |  - 768-dim L2-normalized float32 BLOBs + Sample metadata              |   |
 |   +-----------------------------------+-----------------------------------+   |
 |                                       | load_embedding_scatter_data()         |
 |                                       v                                       |
@@ -153,37 +198,34 @@ The developer dashboard includes an interactive 2D scatter plot to explore the 7
 |   | Backend API: GET /api/embeddings/scatter?method={pca|tsne}            |   |
 |   |                                                                       |   |
 |   |   +-----------------------------------+---------------------------+   |   |
-|   |   | PCA (Linear Projection)           | t-SNE (Non-Linear)        |   |   |
+|   |   | PCA (Linear projection)           | t-SNE (Non-linear)        |   |   |
 |   |   | - sklearn.decomposition.PCA       | - sklearn.manifold.TSNE   |   |   |
-|   |   | - Maximize global variance        | - Preserves local clusters|   |   |
+|   |   | - Maximizes global variance       | - Preserves local clusters|   |   |
 |   |   | - Returns explained variance ratio| - Iterative probability fit|  |   |
 |   |   +-----------------------------------+---------------------------+   |   |
 |   +-----------------------------------+-----------------------------------+   |
 |                                       | JSON [{x, y, label, score, ...}]      |
 |                                       v                                       |
 |   +-----------------------------------------------------------------------+   |
-|   | HTML5 Canvas Visualizer (Frontend)                                    |   |
-|   |  - HiDPI hardware-accelerated rendering                               |   |
-|   |  - Interactive pan (drag) and cursor-centered zoom (mouse wheel)       |   |
-|   |  - Point coloring: By Label (1=Emerald, 0=Rose) or Prediction Score   |   |
-|   |  - Hover Card: Artwork thumbnail preview loaded via /images/{hash}.jpg|   |
-|   |  - Side Inspector: Sample details with one-click relabel & delete     |   |
+|   | HTML5 canvas visualizer (Frontend)                                    |   |
+|   |  - Hardware-accelerated 2D rendering                                  |   |
+|   |  - Interactive pan (drag) and cursor-centered zoom (wheel)            |   |
+|   |  - Point coloring: By label (1=Emerald, 0=Rose) or prediction score   |   |
+|   |  - Hover card: Artwork thumbnail preview loaded via /images/{hash}.jpg|   |
+|   |  - Side inspector: Sample details with one-click relabel & delete     |   |
 |   +-----------------------------------------------------------------------+   |
 +-------------------------------------------------------------------------------+
 ```
 
-### Dimensionality Reduction Algorithms
+### Dimensionality reduction algorithms
 
 #### 1. PCA (Principal Component Analysis)
-* **Mathematical approach**: Linear orthogonal projection. Finds the two eigenvectors of the sample covariance matrix corresponding to the largest eigenvalues.
-* **Preservation**: Preserves **global variance and broad distance relationships**. Distant clusters in 768D stay distant in 2D.
-* **Deterministic**: Fixed computation with zero randomness.
-* **Explained variance**: The endpoint returns `variance_ratio = [PC1, PC2]`, indicating the proportion of total information preserved in the 2D view.
-* **Use case**: Assessing overall dataset balance and viewing the feature space through the lens of linear classifiers like Logistic Regression.
+* Approach: Linear orthogonal projection finding eigenvectors of the sample covariance matrix.
+* Structure: Preserves global variance and broad distance relationships. Distant samples in 768D stay distant in 2D.
+* Determinism: Deterministic calculation with zero randomness.
+* Explained variance: Returns `variance_ratio = [PC1, PC2]`, indicating the proportion of variance captured in 2D.
 
 #### 2. t-SNE (t-Distributed Stochastic Neighbor Embedding)
-* **Mathematical approach**: Non-linear manifold learning. Converts pairwise Euclidean distances into conditional probabilities in high-dimensional space and Student-t distributions in 2D space, minimizing the Kullback-Leibler (KL) divergence via gradient descent.
-* **Preservation**: Preserves **local neighborhoods**. Artworks with similar visual semantics, color palettes, or artistic styles cluster tightly together.
-* **Dynamic perplexity**: Automatically tuned based on sample count: $\text{perplexity} = \max(1, \min(30, \lfloor(N - 1) / 3\rfloor))$.
-* **Use case**: Discovering fine-grained aesthetic sub-clusters (e.g. watercolor, anime portraits, dark landscapes) within your liked artworks.
-
+* Approach: Non-linear manifold learning converting Euclidean distances into probabilities and minimizing Kullback-Leibler divergence.
+* Structure: Preserves local neighborhoods. Artworks with similar visual characteristics cluster together.
+* Perplexity: Scaled dynamically based on sample count: $\text{perplexity} = \max(1, \min(30, \lfloor(N - 1) / 3\rfloor))$.
