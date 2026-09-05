@@ -543,8 +543,12 @@ code {
 
 .badge-outlier {
   position: absolute;
-  top: 8px;
-  right: 8px;
+  bottom: 8px;
+  left: 8px;
+  max-width: calc(100% - 80px);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
   padding: 4px 8px;
   background: rgba(245, 158, 11, 0.92);
   color: #0f172a;
