@@ -19,7 +19,7 @@ The system operates in three modes:
 
 * **Manual mode**: You browse the library and press arrow keys to rate artworks. The userscript captures the primary image, sends the image with your manual label to the backend server, and advances the page.
 * **Supervised mode**: The userscript requests a prediction score from the backend server and displays an on-screen confidence badge. You confirm or override the predicted label before the script advances the page.
-* **Full auto mode**: The userscript requests a prediction score, compares the score against the active decision threshold, dispatches the rating action automatically, and saves the sample to the database with review status set to `0` (unreviewed).
+* **Full auto mode**: The userscript requests a prediction score, compares the score against the active decision threshold, dispatches the rating action automatically, and saves the sample to the database as an unreviewed automated decision (`auto_decision`, `reviewed = 0`). Full auto samples remain unreviewed until a human review confirms them, and only reviewed human-confirmed samples train the model.
 
 ## Quick start
 

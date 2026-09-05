@@ -13,7 +13,6 @@
 // @grant        GM_getValue
 // @connect      localhost
 // @connect      127.0.0.1
-// @connect      *
 // @run-at       document-idle
 // ==/UserScript==
 
@@ -31,7 +30,10 @@
   // ---------------------------------------------------------------------------
   const CONFIG = {
     apiBaseUrl: "http://127.0.0.1:8000",
-    imageContainerSelector: ".StretchedBox, [style*='background-image'], .artwork, .art-card, .image-container, main, body",
+    // Explicit active-card strategy only. This scope must never fall back to
+    // global `body` or `main`: extraction runs strictly inside the active card.
+    activeCardSelector: ".StretchedBox, [style*='background-image'], .artwork, .art-card, .image-container",
+    imageContainerSelector: ".StretchedBox, [style*='background-image'], .artwork, .art-card, .image-container",
     primaryImageSelector: "img",
     minCardDimension: 120, // Min width/height in px for valid artwork elements
     autoModeDelayMs: 1000, // Delay between automated ratings in Full Auto mode
@@ -302,14 +304,77 @@
     return true;
   }
 
+  function isAssociatedWithActiveCard(el, anchorEl) {
+    if (!el || !anchorEl) return false;
+    try {
+      if (el === anchorEl) return true;
+      if (typeof anchorEl.contains === "function" && anchorEl.contains(el)) return true;
+      if (typeof el.contains === "function" && el.contains(anchorEl)) return true;
+      const card = el.closest ? el.closest(CONFIG.activeCardSelector) : null;
+      if (!card) return false;
+      if (card === anchorEl) return true;
+      if (typeof anchorEl.contains === "function" && anchorEl.contains(card)) return true;
+      if (typeof card.contains === "function" && card.contains(anchorEl)) return true;
+      return false;
+    } catch (e) {
+      return false;
+    }
+  }
+
+  // Fail-closed gate: the Primary image element must remain connected, visible,
+  // and associated with the active card. Returns false when validation fails.
+  function validatePrimaryImage(el, anchorEl) {
+    if (!el || !anchorEl) return false;
+    try {
+      if (!el.isConnected || !anchorEl.isConnected) return false;
+    } catch (e) {
+      return false;
+    }
+    if (!isElementVisible(el)) return false;
+    if (el.getAttribute && el.getAttribute("aria-hidden") === "true") return false;
+    if (!isAssociatedWithActiveCard(el, anchorEl)) return false;
+    return true;
+  }
+
+  // Revalidate a captured artwork immediately before /api/record and before
+  // dispatching any arrow-key rating signal. Fail closed on any failure.
+  function revalidateCapturedArtwork(captured) {
+    if (!captured || !captured.imageBase64 || !captured.element || !captured.anchorEl) {
+      return false;
+    }
+    return validatePrimaryImage(captured.element, captured.anchorEl);
+  }
+
+  function logExtractionFailure(flow) {
+    const message = `Active artwork validation failed (${flow}): no connected, visible Primary image associated with the active card. No sample recorded and no rating action dispatched.`;
+    console.error(message);
+    sendLogToDashboard("ERROR", message, currentMode, { flow: flow });
+  }
+
   async function extractActiveArtworkImage() {
-    // 1. Primary Strategy: Hit-test the center of the main card / viewport to get the active topmost slide
-    const candidateContainers = Array.from(
-      document.querySelectorAll(CONFIG.imageContainerSelector)
+    // Explicit active-card strategy only: resolve the visible active card, then
+    // extract the Primary image strictly inside it. Never falls back to global
+    // `body`/`main`, canvas, or desktop screen capture. Fails closed (null).
+    const candidateCards = Array.from(
+      document.querySelectorAll(CONFIG.activeCardSelector)
     ).filter(isElementVisible);
 
-    // If candidate containers exist, take the largest active container as the card anchor
-    let anchorEl = candidateContainers[0] || document.body;
+    if (candidateCards.length === 0) {
+      logExtractionFailure("extract: no visible active card");
+      return null;
+    }
+
+    // Anchor on the largest visible active card.
+    let anchorEl = candidateCards[0];
+    let anchorArea = 0;
+    for (const card of candidateCards) {
+      const rect = card.getBoundingClientRect();
+      const area = rect.width * rect.height;
+      if (area > anchorArea) {
+        anchorArea = area;
+        anchorEl = card;
+      }
+    }
     const anchorRect = anchorEl.getBoundingClientRect();
     const centerX = Math.max(10, Math.min(window.innerWidth - 10, Math.round(anchorRect.left + anchorRect.width / 2)));
     const centerY = Math.max(10, Math.min(window.innerHeight - 10, Math.round(anchorRect.top + anchorRect.height / 2)));
@@ -321,39 +386,40 @@
       // Ignore overlays, tooltips, HUD, or interactive buttons
       if (el.closest("#taste-classifier-hud") || el.tagName === "BUTTON") continue;
 
-      // Check current element for image
+      // Check current element for image (must validate before accepting)
       const imgUrl = getImageUrlFromElement(el);
-      if (imgUrl && isElementVisible(el) && el.getAttribute("aria-hidden") !== "true") {
+      if (imgUrl && validatePrimaryImage(el, anchorEl)) {
         try {
           const b64 = await convertImgSrcToBase64(imgUrl);
-          if (b64) {
+          if (b64 && validatePrimaryImage(el, anchorEl)) {
             const count = inspectAndLogImageSet(el);
-            return { imageBase64: b64, element: el, imageSetCount: count };
+            return { imageBase64: b64, element: el, anchorEl: anchorEl, imageSetCount: count };
           }
         } catch (e) {
           console.warn("Center hit-test image fetch failed:", e);
         }
       }
 
-      // Check children of current element
+      // Check children of current element, scoped to the active card
       const childWithBg = el.querySelector("[style*='background-image'], .StretchedBox, img");
-      if (childWithBg && isElementVisible(childWithBg) && childWithBg.getAttribute("aria-hidden") !== "true") {
+      if (childWithBg && validatePrimaryImage(childWithBg, anchorEl)) {
         const childUrl = getImageUrlFromElement(childWithBg);
         if (childUrl) {
           try {
             const b64 = await convertImgSrcToBase64(childUrl);
-            if (b64) {
+            if (b64 && validatePrimaryImage(childWithBg, anchorEl)) {
               const count = inspectAndLogImageSet(childWithBg);
-              return { imageBase64: b64, element: childWithBg, imageSetCount: count };
+              return { imageBase64: b64, element: childWithBg, anchorEl: anchorEl, imageSetCount: count };
             }
           } catch (e) { }
         }
       }
     }
 
-    // 2. Secondary Strategy: Filter and score all candidate elements by visibility, active slide state, and opacity
+    // 2. In-card fallback: score Primary-image candidates strictly inside the
+    // active card subtree by visibility, active slide state, and opacity.
     const allCandidates = Array.from(
-      document.querySelectorAll(`${CONFIG.primaryImageSelector}, ${CONFIG.imageContainerSelector}`)
+      anchorEl.querySelectorAll(`${CONFIG.primaryImageSelector}, ${CONFIG.imageContainerSelector}`)
     ).filter(isElementVisible);
 
     // Score candidates: give priority to aria-hidden != true, opacity == 1, and highest z-index
@@ -379,39 +445,22 @@
     scoredCandidates.sort((a, b) => b.score - a.score);
 
     for (const candidate of scoredCandidates) {
+      if (!validatePrimaryImage(candidate.el, anchorEl)) continue;
       try {
         const b64 = await convertImgSrcToBase64(candidate.url);
-        if (b64) {
+        if (b64 && validatePrimaryImage(candidate.el, anchorEl)) {
           const count = inspectAndLogImageSet(candidate.el);
-          return { imageBase64: b64, element: candidate.el, imageSetCount: count };
+          return { imageBase64: b64, element: candidate.el, anchorEl: anchorEl, imageSetCount: count };
         }
       } catch (e) {
         console.warn("Scored candidate fetch failed:", e);
       }
     }
 
-    // 3. Canvas Fallback
-    const canvas = document.querySelector("canvas");
-    if (canvas && canvas.width > 100 && canvas.height > 100) {
-      try {
-        const b64 = canvas.toDataURL("image/jpeg", 0.95);
-        const count = inspectAndLogImageSet(canvas);
-        return { imageBase64: b64, element: canvas, imageSetCount: count };
-      } catch (e) { }
-    }
-
-    // 4. Absolute Fallback: Desktop Screen Capture API
-    const targetEl = scoredCandidates[0]?.el || anchorEl || document.body;
-    const rect = targetEl.getBoundingClientRect();
-    try {
-      console.info("Using screen capture fallback...");
-      const b64 = await requestScreenCapture(rect.left, rect.top, rect.width, rect.height);
-      const count = inspectAndLogImageSet(targetEl);
-      return { imageBase64: b64, element: targetEl, imageSetCount: count };
-    } catch (e) {
-      console.error("All extraction strategies failed:", e);
-      return null;
-    }
+    // Fail closed: no canvas fallback and no desktop screen capture. If the
+    // active card / Primary image cannot be validated, record and rate nothing.
+    logExtractionFailure("extract: no validated Primary image in active card");
+    return null;
   }
 
   function convertImgSrcToBase64(url) {
@@ -428,32 +477,6 @@
             reader.readAsDataURL(response.response);
           } else {
             reject(new Error(`Failed to fetch image: ${response.status}`));
-          }
-        },
-        onerror: reject,
-      });
-    });
-  }
-
-  function requestScreenCapture(x, y, width, height) {
-    return new Promise((resolve, reject) => {
-      GM_xmlhttpRequest({
-        method: "POST",
-        url: `${CONFIG.apiBaseUrl}/api/capture`,
-        headers: { "Content-Type": "application/json" },
-        data: JSON.stringify({
-          x: Math.round(window.screenX + x),
-          y: Math.round(window.screenY + y),
-          width: Math.round(width),
-          height: Math.round(height),
-        }),
-        onload: function (res) {
-          try {
-            const data = JSON.parse(res.responseText);
-            if (data.image_base64) resolve(data.image_base64);
-            else reject(new Error("No image returned from screen capture"));
-          } catch (e) {
-            reject(e);
           }
         },
         onerror: reject,
@@ -503,31 +526,107 @@
   }
 
   // ---------------------------------------------------------------------------
+  // Full Auto Effectiveness Warning Acknowledgement
+  // ---------------------------------------------------------------------------
+  // Every Full auto activation checks the temporal-holdout effectiveness state
+  // from the backend. When effectiveness is unavailable or below the agreed
+  // recall-first target, the user must explicitly acknowledge the warning
+  // before Full auto starts. After acknowledgement Full auto remains usable
+  // per user decision.
+  let fullAutoAcknowledged = false;
+
+  function fetchEffectivenessState() {
+    return new Promise((resolve) => {
+      GM_xmlhttpRequest({
+        method: "GET",
+        url: `${CONFIG.apiBaseUrl}/api/metrics`,
+        onload: function (res) {
+          try {
+            const data = JSON.parse(res.responseText);
+            const model = (data && data.model_status) || {};
+            const eff = model.effectiveness || {};
+            const reasons = model.warning_reasons || eff.warning_reasons || [];
+            resolve({
+              warningActive: Boolean(model.warning_active || eff.warning_active),
+              status: eff.status || "unknown",
+              reasons: reasons,
+            });
+          } catch (e) {
+            resolve({ warningActive: true, status: "unknown", reasons: ["temporal_evaluation_unavailable"] });
+          }
+        },
+        onerror: function () {
+          resolve({ warningActive: true, status: "unknown", reasons: ["temporal_evaluation_unavailable"] });
+        },
+      });
+    });
+  }
+
+  function requestFullAutoAcknowledgement(state) {
+    const reasonText = (state.reasons && state.reasons.length > 0)
+      ? state.reasons.join("; ")
+      : "temporal evaluation unavailable";
+    const message =
+      `Full auto effectiveness warning (${state.status}): ${reasonText}.\n\n` +
+      `The latest temporal-holdout evaluation does not meet the agreed recall-first target ` +
+      `(at least 30 holdout Likes, recall >= 0.80, precision >= 0.60).\n\n` +
+      `Press OK to acknowledge this warning and enable Full auto anyway, or Cancel to stay in Manual mode.`;
+    return window.confirm(message);
+  }
+
+  async function tryEnableFullAuto() {
+    let state;
+    try {
+      state = await fetchEffectivenessState();
+    } catch (e) {
+      state = { warningActive: true, status: "unknown", reasons: ["temporal_evaluation_unavailable"] };
+    }
+    if (state.warningActive) {
+      const acknowledged = requestFullAutoAcknowledgement(state);
+      if (!acknowledged) {
+        console.info("Full auto activation declined: effectiveness warning not acknowledged.");
+        return;
+      }
+    }
+    fullAutoAcknowledged = true;
+    currentMode = "auto";
+    updateHUDMode("auto");
+    runFullAutoStep();
+  }
+
+  // ---------------------------------------------------------------------------
   // Operating Modes Execution
   // ---------------------------------------------------------------------------
 
-  // Manual Mode Handler
+  // Manual Mode Handler (fail closed: no record and no rating signal unless
+  // the active card / Primary image validates immediately before dispatch).
   async function handleManualRating(label) {
     if (isProcessing) return;
     isProcessing = true;
 
     try {
       const extracted = await extractActiveArtworkImage();
-      if (extracted && extracted.imageBase64) {
-        sendRecordSample({
-          image_base64: extracted.imageBase64,
-          label: label,
-          mode: "manual",
-          reviewed: 1,
-          image_set_count: extracted.imageSetCount,
-        });
+      if (!extracted || !extracted.imageBase64 || !revalidateCapturedArtwork(extracted)) {
+        logExtractionFailure("manual");
+        return;
       }
+      await sendRecordSample({
+        image_base64: extracted.imageBase64,
+        label: label,
+        mode: "manual",
+        reviewed: 1,
+        image_set_count: extracted.imageSetCount,
+      });
+      if (!revalidateCapturedArtwork(extracted)) {
+        logExtractionFailure("manual-dispatch");
+        return;
+      }
+      if (label === 1) dispatchLikeAction();
+      else dispatchDislikeAction();
     } catch (err) {
       console.error("Manual recording error:", err);
     } finally {
       isProcessing = false;
-      if (label === 1) dispatchLikeAction();
-      else dispatchDislikeAction();
     }
   }
 
@@ -541,7 +640,8 @@
 
     try {
       const extracted = await extractActiveArtworkImage();
-      if (!extracted || !extracted.imageBase64) {
+      if (!extracted || !extracted.imageBase64 || !revalidateCapturedArtwork(extracted)) {
+        logExtractionFailure("supervised-predict");
         isProcessing = false;
         return;
       }
@@ -556,8 +656,16 @@
         return;
       }
 
+      if (!revalidateCapturedArtwork(extracted)) {
+        logExtractionFailure("supervised-predict");
+        isProcessing = false;
+        return;
+      }
+
       supervisedPendingData = {
         imageBase64: extracted.imageBase64,
+        element: extracted.element,
+        anchorEl: extracted.anchorEl,
         predictionScore: pred.prediction_score,
         predictedDecision: pred.decision,
         imageSetCount: extracted.imageSetCount,
@@ -587,6 +695,13 @@
 
     const finalLabel = accept ? data.predictedDecision : (data.predictedDecision === 1 ? 0 : 1);
 
+    // Revalidate the captured artwork immediately before recording and action
+    // dispatch. Fail closed: no /api/record and no arrow-key signal on failure.
+    if (!revalidateCapturedArtwork(data)) {
+      logExtractionFailure("supervised-resolve");
+      return;
+    }
+
     await sendRecordSample({
       image_base64: data.imageBase64,
       label: finalLabel,
@@ -595,6 +710,11 @@
       reviewed: 1,
       image_set_count: data.imageSetCount,
     });
+
+    if (!revalidateCapturedArtwork(data)) {
+      logExtractionFailure("supervised-dispatch");
+      return;
+    }
 
     if (finalLabel === 1) dispatchLikeAction();
     else dispatchDislikeAction();
@@ -620,7 +740,8 @@
       }
 
       const extracted = await extractActiveArtworkImage();
-      if (!extracted || !extracted.imageBase64) {
+      if (!extracted || !extracted.imageBase64 || !revalidateCapturedArtwork(extracted)) {
+        logExtractionFailure("auto");
         autoModeTimer = setTimeout(runFullAutoStep, 500);
         return;
       }
@@ -633,6 +754,14 @@
         alert("Model not trained yet! Please gather ratings in Manual Mode first.");
         currentMode = "manual";
         updateHUDMode("manual");
+        return;
+      }
+
+      // Revalidate immediately before recording and dispatching. Fail closed:
+      // no /api/record and no arrow-key signal when validation fails.
+      if (!revalidateCapturedArtwork(extracted)) {
+        logExtractionFailure("auto");
+        autoModeTimer = setTimeout(runFullAutoStep, 500);
         return;
       }
 
@@ -649,6 +778,11 @@
       });
 
       lastAutoActionTime = Date.now();
+      if (!revalidateCapturedArtwork(extracted)) {
+        logExtractionFailure("auto-dispatch");
+        autoModeTimer = setTimeout(runFullAutoStep, CONFIG.autoModeDelayMs);
+        return;
+      }
       if (decision === 1) dispatchLikeAction();
       else dispatchDislikeAction();
 
@@ -766,15 +900,17 @@
       e.preventDefault();
       if (currentMode === "auto") {
         currentMode = "manual";
+        fullAutoAcknowledged = false;
         if (autoModeTimer) {
           clearTimeout(autoModeTimer);
           autoModeTimer = null;
         }
+        updateHUDMode(currentMode);
       } else {
-        currentMode = "auto";
-        runFullAutoStep();
+        // Every Full auto activation re-checks effectiveness and requires
+        // explicit acknowledgement when the warning is active.
+        tryEnableFullAuto();
       }
-      updateHUDMode(currentMode);
     } else if (currentMode === "manual") {
       if (e.key === "ArrowLeft") {
         e.preventDefault();

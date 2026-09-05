@@ -26,7 +26,7 @@ import torch
 from PIL import Image
 from sklearn.linear_model import LogisticRegression
 from sklearn.metrics import average_precision_score, precision_recall_curve, auc, fbeta_score
-from sklearn.model_selection import StratifiedKFold, train_test_split
+from sklearn.model_selection import StratifiedKFold
 
 # Default file paths
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
@@ -40,6 +40,12 @@ EMBEDDING_DIM = 768
 DEFAULT_DECISION_THRESHOLD = 0.35
 DEFAULT_ZERO_SHOT_PROMPT = "goth aesthetic alternative indie girl style"
 HYPERPARAMETER_C_GRID = [0.01, 0.1, 0.5, 1.0, 2.0, 5.0, 10.0]
+
+# Temporal-holdout effectiveness warning targets (agreed recall-first operational
+# warning threshold, not proof that a Taste profile is universally effective).
+TEMPORAL_MIN_HOLDOUT_LIKES = 30
+EFFECTIVENESS_RECALL_TARGET = 0.80
+EFFECTIVENESS_PRECISION_TARGET = 0.60
 
 # Global lazy-loaded embedding model instance
 _EMBEDDING_MODEL = None
@@ -129,6 +135,66 @@ def get_candidate_class_weights(y_train: np.ndarray) -> list[tuple[str, Any]]:
     ]
 
 
+def _order_by_creation(
+    X: np.ndarray,
+    y: np.ndarray,
+    sample_ids: list[int] | None,
+) -> tuple[np.ndarray, np.ndarray, list[int] | None]:
+    """Order the Feature matrix and Label vector by Sample creation order.
+
+    Creation order is the ascending Sample ``id`` (which tracks ``created_at``).
+    Callers passing ``sample_ids`` from ``load_training_matrix()`` already supply
+    training-eligible Samples in ascending ``id`` order; this is a defensive
+    re-sort so the temporal boundary never depends on caller ordering.
+    """
+    if sample_ids is None:
+        return X, y, None
+    order = np.argsort(np.asarray(sample_ids, dtype=np.int64), kind="stable")
+    ordered_ids = [sample_ids[int(i)] for i in order]
+    return X[order], y[order], ordered_ids
+
+
+def _temporal_partition_sizes(sample_count: int, holdout_ratio: float) -> tuple[int, int]:
+    """Return ``(n_dev, n_holdout)`` sizes for a contiguous temporal split.
+
+    The holdout is always the newest suffix; the development partition is the
+    earlier prefix. Neither partition is shuffled across time.
+    """
+    if holdout_ratio is None or holdout_ratio <= 0.0 or sample_count < 2:
+        return sample_count, 0
+    ratio = float(np.clip(holdout_ratio, 0.05, 0.40))
+    n_holdout = int(round(sample_count * ratio))
+    n_holdout = max(0, min(n_holdout, sample_count - 1))
+    return sample_count - n_holdout, n_holdout
+
+
+def _threshold_metrics_at(
+    y_true: np.ndarray,
+    probabilities: np.ndarray,
+    threshold: float,
+) -> dict[str, Any]:
+    """Compute recall, precision, F2, and confusion counts at a threshold."""
+    binary_preds = (probabilities >= threshold).astype(int)
+    tp = int(np.sum((binary_preds == 1) & (y_true == 1)))
+    fp = int(np.sum((binary_preds == 1) & (y_true == 0)))
+    tn = int(np.sum((binary_preds == 0) & (y_true == 0)))
+    fn = int(np.sum((binary_preds == 0) & (y_true == 1)))
+    rec = float(tp / (tp + fn)) if (tp + fn) > 0 else 0.0
+    prec = float(tp / (tp + fp)) if (tp + fp) > 0 else 0.0
+    f2 = float(fbeta_score(y_true, binary_preds, beta=2, zero_division=0))
+    return {
+        "recall": round(rec, 4),
+        "precision": round(prec, 4),
+        "f2_score": round(f2, 4),
+        "confusion_matrix": {
+            "true_positives": tp,
+            "false_positives": fp,
+            "true_negatives": tn,
+            "false_negatives": fn,
+        },
+    }
+
+
 def train_taste_classifier(
     X: np.ndarray,
     y: np.ndarray,
@@ -137,30 +203,52 @@ def train_taste_classifier(
     threshold: float | None = None,
     min_recall_floor: float = 0.70,
     holdout_ratio: float = 0.15,
+    min_holdout_positives: int = TEMPORAL_MIN_HOLDOUT_LIKES,
+    effectiveness_recall_target: float = EFFECTIVENESS_RECALL_TARGET,
+    effectiveness_precision_target: float = EFFECTIVENESS_PRECISION_TARGET,
     baseline_prompt_text: str | None = None,
     baseline_image_base64: str | None = None,
     reset_baseline_to_default: bool = False,
     model_path: Path | str | None = None,
 ) -> dict[str, Any]:
-    """Fit a balanced Logistic Regression classifier on feature matrix X and label vector y.
+    """Fit a balanced Logistic Regression classifier on training-eligible Samples.
 
-    Uses Stratified 5-Fold Cross-Validation on the development partition to generate
-    out-of-fold predictions, calibrates the decision threshold (using a hybrid strategy
-    maximizing F2 with an enforced recall floor or target recall), evaluates generalization
-    against a chronological holdout partition, and fits final model weights on 100% of labeled data.
+    The caller supplies only training-eligible Samples (binary label,
+    ``reviewed = 1``, human-confirmed label provenance) via
+    ``load_training_matrix()``. Samples are ordered by creation (ascending
+    Sample ``id``) and partitioned into a contiguous temporal split: the newest
+    suffix is the temporal holdout and the earlier prefix is the development
+    partition. Neither partition is shuffled across time and no random split is
+    ever substituted.
+
+    The development partition is used only for Logistic Regression parameter
+    selection (Stratified K-Fold cross-validation over the C grid) and Decision
+    threshold calibration. The temporal holdout is the only model-effectiveness
+    report and the source of the Full auto effectiveness warning. When the
+    holdout cannot retain both classes and the configured minimum Positive-class
+    (Like) count, temporal evaluation is reported as
+    ``temporal_evaluation_unavailable`` instead of falling back to a random
+    split, and the effectiveness warning is active. The final classifier is fit
+    on all training-eligible Samples only after temporal evaluation is recorded.
 
     Args:
-        X: Feature matrix of shape (N, 768).
+        X: Feature matrix of shape (N, 768) for training-eligible Samples.
         y: Label vector of shape (N,) with binary integers (0 or 1).
-        sample_ids: Optional parallel list of integer sample IDs.
+        sample_ids: Optional parallel list of integer Sample IDs in any order;
+            used to restore creation order and to record the eval boundary.
         target_recall: Optional target recall rate for decision threshold calibration.
         threshold: Optional explicit decision threshold. If specified, overrides calibration.
         min_recall_floor: Minimum recall floor used for hybrid F2 threshold calibration (default 0.70).
-        holdout_ratio: Fraction of most recent samples reserved for generalization holdout (default 0.15).
+        holdout_ratio: Fraction of newest Samples reserved for the temporal holdout (default 0.15).
+        min_holdout_positives: Minimum Positive-class (Like) count required for a
+            valid temporal holdout (default 30).
+        effectiveness_recall_target: Recall target for the effectiveness warning (default 0.80).
+        effectiveness_precision_target: Precision target for the effectiveness warning (default 0.60).
         model_path: Destination path for saved model pickle file.
 
     Returns:
-        Dictionary containing training status, sample distribution, and out-of-fold evaluation metrics.
+        Dictionary containing training status, sample distribution, development
+        tuning metrics, temporal effectiveness metrics, and warning state.
     """
     actual_model_path = Path(model_path) if model_path is not None else Path(MODEL_PATH)
     actual_model_path.parent.mkdir(parents=True, exist_ok=True)
@@ -170,62 +258,90 @@ def train_taste_classifier(
     class_counts = dict(zip(unique_classes.tolist(), counts.tolist()))
     positive_count = class_counts.get(1, 0)
     negative_count = class_counts.get(0, 0)
+    training_eligible_counts = {
+        "sample_count": sample_count,
+        "positive_count": positive_count,
+        "negative_count": negative_count,
+    }
 
-    # Check for minimum class representation
+    # Check for minimum class representation: reject insufficient data for model
+    # use instead of producing in-sample effectiveness metrics.
     if positive_count < 1 or negative_count < 1:
         return {
             "status": "insufficient_data",
-            "message": "Need at least 1 Like (positive class) and 1 Dislike (negative class) sample to train.",
+            "message": "Need at least 1 Like (Positive class) and 1 Dislike (Negative class) training-eligible Sample to train. Rejected for model use: no in-sample effectiveness metrics reported.",
             "sample_count": sample_count,
             "positive_count": positive_count,
             "negative_count": negative_count,
         }
 
-    # 1. Partition data into development set and stratified holdout set
-    use_holdout = False
-    holdout_metrics: dict[str, Any] | None = None
-    generalization_warning = False
-    dev_ids: list[int] | None = None
+    # 1. Order by creation and partition into development prefix / holdout suffix.
+    X, y, sample_ids = _order_by_creation(X, y, sample_ids)
+    n_dev, n_holdout = _temporal_partition_sizes(sample_count, holdout_ratio)
 
-    if holdout_ratio > 0.0 and sample_count >= 5 and positive_count >= 2 and negative_count >= 2:
-        try:
-            test_size = float(np.clip(holdout_ratio, 0.05, 0.40))
-            indices = np.arange(sample_count)
-            dev_idx, holdout_idx = train_test_split(
-                indices,
-                test_size=test_size,
-                stratify=y,
-                random_state=42,
-            )
-            if (
-                np.sum(y[dev_idx] == 1) >= 1
-                and np.sum(y[dev_idx] == 0) >= 1
-                and np.sum(y[holdout_idx] == 1) >= 1
-                and np.sum(y[holdout_idx] == 0) >= 1
-            ):
-                use_holdout = True
-                X_dev = X[dev_idx]
-                y_dev = y[dev_idx]
-                dev_ids = [sample_ids[i] for i in dev_idx] if sample_ids else None
-                X_holdout = X[holdout_idx]
-                y_holdout = y[holdout_idx]
-        except Exception:
-            use_holdout = False
-
-    if not use_holdout:
-        X_dev = X
-        y_dev = y
-        dev_ids = sample_ids
-        X_holdout = None
-        y_holdout = None
+    X_dev = X[:n_dev]
+    y_dev = y[:n_dev]
+    X_holdout = X[n_dev:] if n_holdout > 0 else None
+    y_holdout = y[n_dev:] if n_holdout > 0 else None
+    dev_ids = sample_ids[:n_dev] if sample_ids is not None else None
+    holdout_ids = sample_ids[n_dev:] if sample_ids is not None and n_holdout > 0 else None
 
     dev_pos = int(np.sum(y_dev == 1))
     dev_neg = int(np.sum(y_dev == 0))
 
-    # 2. Hyperparameter search over C and candidate class weights
+    if dev_pos < 1 or dev_neg < 1:
+        return {
+            "status": "insufficient_data",
+            "message": "Development prefix lacks both classes; cannot tune or evaluate. Rejected for model use: collect earlier training-eligible Samples of both classes.",
+            "sample_count": sample_count,
+            "positive_count": positive_count,
+            "negative_count": negative_count,
+        }
+
+    holdout_pos = int(np.sum(y_holdout == 1)) if y_holdout is not None else 0
+    holdout_neg = int(np.sum(y_holdout == 0)) if y_holdout is not None else 0
+
+    # 2. Validate the temporal holdout: both classes plus the minimum Like count.
+    # Never substitute a random split when validation fails.
+    temporal_reasons: list[str] = []
+    temporal_available = True
+    if y_holdout is None or n_holdout == 0:
+        temporal_available = False
+        if holdout_ratio is not None and holdout_ratio > 0.0:
+            temporal_reasons.append("holdout_size_zero")
+        else:
+            temporal_reasons.append("holdout_disabled")
+    else:
+        if holdout_pos < 1:
+            temporal_available = False
+            temporal_reasons.append("holdout_missing_positive_class")
+        if holdout_neg < 1:
+            temporal_available = False
+            temporal_reasons.append("holdout_missing_negative_class")
+        if holdout_pos < int(min_holdout_positives):
+            temporal_available = False
+            temporal_reasons.append("holdout_likes_below_minimum")
+    if not temporal_available:
+        temporal_reasons.insert(0, "temporal_evaluation_unavailable")
+
+    eval_boundary: dict[str, Any] = {
+        "dev_size": n_dev,
+        "holdout_size": n_holdout,
+        "holdout_ratio": float(holdout_ratio),
+        "min_holdout_positives": int(min_holdout_positives),
+        "dev_max_id": dev_ids[-1] if dev_ids else None,
+        "holdout_min_id": holdout_ids[0] if holdout_ids else None,
+        "dev_sample_ids": list(dev_ids) if dev_ids is not None else None,
+        "holdout_sample_ids": list(holdout_ids) if holdout_ids is not None else None,
+    }
+
+    # 3. Development-partition tuning: hyperparameter search over C and
+    # candidate class weights. Cross-validation here selects parameters only;
+    # it is never the model-effectiveness report.
     n_splits = min(5, dev_pos, dev_neg)
     oof_probabilities = np.zeros(len(y_dev), dtype=np.float32)
     tuning_results: list[dict[str, Any]] = []
+    tuning_limited = False
 
     if n_splits >= 2:
         eval_type = "stratified_cv"
@@ -295,8 +411,13 @@ def train_taste_classifier(
         centroid_pr_auc = float(auc(cent_rec, cent_prec)) if len(cent_rec) > 1 else 0.0
 
     else:
-        # Cold start fallback when positive count < 2
-        eval_type = "in_sample_fallback"
+        # Limited development data (< 2 Samples of a class): no stratified
+        # folds are possible, so fit a single default configuration on the
+        # development prefix for threshold calibration only. These in-development
+        # scores are tuning signals, never an effectiveness report, and temporal
+        # evaluation remains unavailable for such small collections.
+        eval_type = "limited_tuning_data"
+        tuning_limited = True
         best_C = 1.0
         best_weight_key = "balanced"
         best_weight_param = "balanced"
@@ -321,7 +442,7 @@ def train_taste_classifier(
             "average_precision": round(c_ap, 4),
         })
 
-        # In-sample centroid baseline fallback
+        # Development-prefix centroid baseline (tuning reference only)
         pos_mask = (y_dev == 1)
         if np.any(pos_mask):
             c_vec = np.mean(X_dev[pos_mask], axis=0)
@@ -372,7 +493,7 @@ def train_taste_classifier(
         "prompt_text": ref_source if ref_type == "text" else DEFAULT_ZERO_SHOT_PROMPT,
     }
 
-    # 4. Out-of-fold Precision-Recall curve and metrics
+    # 4. Development Precision-Recall curve and tuning metrics
     precisions, recalls, pr_thresholds = precision_recall_curve(y_dev, oof_probabilities)
     pr_auc_score = float(auc(recalls, precisions)) if len(recalls) > 1 else 0.0
     ap_score = float(average_precision_score(y_dev, oof_probabilities)) if len(np.unique(y_dev)) > 1 else 0.0
@@ -416,19 +537,26 @@ def train_taste_classifier(
 
         calibrated_threshold = float(round(np.clip(calibrated_threshold, 0.05, 0.95), 2))
 
-    # Evaluate out-of-fold metrics at calibrated threshold
-    binary_preds = (oof_probabilities >= calibrated_threshold).astype(int)
-    tp = int(np.sum((binary_preds == 1) & (y_dev == 1)))
-    fp = int(np.sum((binary_preds == 1) & (y_dev == 0)))
-    tn = int(np.sum((binary_preds == 0) & (y_dev == 0)))
-    fn = int(np.sum((binary_preds == 0) & (y_dev == 1)))
+    # Evaluate development tuning metrics at calibrated threshold
+    tuning_at_threshold = _threshold_metrics_at(y_dev, oof_probabilities, calibrated_threshold)
 
-    rec = float(tp / (tp + fn)) if (tp + fn) > 0 else 0.0
-    prec = float(tp / (tp + fp)) if (tp + fp) > 0 else 0.0
-    f2 = float(fbeta_score(y_dev, binary_preds, beta=2, zero_division=0))
+    if threshold is not None:
+        threshold_source = "explicit"
+    elif target_recall is not None:
+        threshold_source = "target_recall"
+    else:
+        threshold_source = "calibrated"
 
-    # 6. Holdout generalization verification
-    if use_holdout and X_holdout is not None and y_holdout is not None:
+    # 6. Temporal effectiveness evaluation (the only effectiveness report).
+    # A development-only classifier scores the newer holdout suffix; the final
+    # classifier is fit afterwards on all training-eligible Samples.
+    temporal_holdout: dict[str, Any] | None = None
+    holdout_metrics: dict[str, Any] | None = None
+    holdout_probabilities: list[float] = []
+    y_holdout_list: list[int] = []
+    warning_reasons: list[str] = list(temporal_reasons)
+
+    if temporal_available and X_holdout is not None and y_holdout is not None:
         dev_clf = LogisticRegression(
             class_weight=best_weight_param,
             C=best_C,
@@ -437,43 +565,79 @@ def train_taste_classifier(
             random_state=42,
         )
         dev_clf.fit(X_dev, y_dev)
-        holdout_probs = dev_clf.predict_proba(X_holdout)[:, 1]
+        holdout_probs = dev_clf.predict_proba(X_holdout)[:, 1].astype(np.float32)
 
         h_precisions, h_recalls, _ = precision_recall_curve(y_holdout, holdout_probs)
         h_pr_auc = float(auc(h_recalls, h_precisions)) if len(h_recalls) > 1 else 0.0
         h_ap = float(average_precision_score(y_holdout, holdout_probs)) if len(np.unique(y_holdout)) > 1 else 0.0
+        h_at_threshold = _threshold_metrics_at(y_holdout, holdout_probs, calibrated_threshold)
+        h_rec = float(h_at_threshold["recall"])
+        h_prec = float(h_at_threshold["precision"])
 
-        h_preds = (holdout_probs >= calibrated_threshold).astype(int)
-        h_tp = int(np.sum((h_preds == 1) & (y_holdout == 1)))
-        h_fp = int(np.sum((h_preds == 1) & (y_holdout == 0)))
-        h_tn = int(np.sum((h_preds == 0) & (y_holdout == 0)))
-        h_fn = int(np.sum((h_preds == 0) & (y_holdout == 1)))
+        if h_rec < float(effectiveness_recall_target):
+            warning_reasons.append("recall_below_target")
+        if h_prec < float(effectiveness_precision_target):
+            warning_reasons.append("precision_below_target")
+        if holdout_pos < TEMPORAL_MIN_HOLDOUT_LIKES:
+            warning_reasons.append("holdout_likes_below_minimum")
 
-        h_rec = float(h_tp / (h_tp + h_fn)) if (h_tp + h_fn) > 0 else 0.0
-        h_prec = float(h_tp / (h_tp + h_fp)) if (h_tp + h_fp) > 0 else 0.0
-        h_f2 = float(fbeta_score(y_holdout, h_preds, beta=2, zero_division=0))
-
-        generalization_warning = bool(h_pr_auc < (pr_auc_score - 0.25))
-
-        holdout_metrics = {
+        temporal_holdout = {
+            "status": "available",
             "sample_count": len(y_holdout),
-            "positive_count": int(np.sum(y_holdout == 1)),
-            "negative_count": int(np.sum(y_holdout == 0)),
+            "positive_count": holdout_pos,
+            "negative_count": holdout_neg,
             "pr_auc": round(h_pr_auc, 4),
             "average_precision": round(h_ap, 4),
-            "recall": round(h_rec, 4),
-            "precision": round(h_prec, 4),
-            "f2_score": round(h_f2, 4),
-            "confusion_matrix": {
-                "true_positives": h_tp,
-                "false_positives": h_fp,
-                "true_negatives": h_tn,
-                "false_negatives": h_fn,
-            },
-            "generalization_warning": generalization_warning,
+            "recall": h_at_threshold["recall"],
+            "precision": h_at_threshold["precision"],
+            "f2_score": h_at_threshold["f2_score"],
+            "confusion_matrix": h_at_threshold["confusion_matrix"],
+            "eval_boundary": dict(eval_boundary),
+            "recall_target": float(effectiveness_recall_target),
+            "precision_target": float(effectiveness_precision_target),
+            "min_holdout_positives": TEMPORAL_MIN_HOLDOUT_LIKES,
         }
+        holdout_metrics = dict(temporal_holdout)
+        holdout_probabilities = [float(p) for p in holdout_probs]
+        y_holdout_list = [int(v) for v in y_holdout.tolist()]
+    else:
+        temporal_holdout = {
+            "status": "temporal_evaluation_unavailable",
+            "sample_count": n_holdout,
+            "positive_count": holdout_pos,
+            "negative_count": holdout_neg,
+            "eval_boundary": dict(eval_boundary),
+            "reasons": list(temporal_reasons),
+            "recall_target": float(effectiveness_recall_target),
+            "precision_target": float(effectiveness_precision_target),
+            "min_holdout_positives": TEMPORAL_MIN_HOLDOUT_LIKES,
+        }
+        holdout_metrics = None
 
-    # 7. Fit final model on 100% of labeled data
+    if temporal_available and not warning_reasons:
+        effectiveness_status = "meets_target"
+    elif temporal_available:
+        effectiveness_status = "below_target"
+    else:
+        effectiveness_status = "temporal_evaluation_unavailable"
+
+    warning_active = len(warning_reasons) > 0
+    # Backwards-compatible alias: the legacy generalization flag now mirrors the
+    # recall-first effectiveness warning.
+    generalization_warning = bool(warning_active)
+
+    effectiveness = {
+        "status": effectiveness_status,
+        "warning_active": warning_active,
+        "warning_reasons": list(warning_reasons),
+        "recall_target": float(effectiveness_recall_target),
+        "precision_target": float(effectiveness_precision_target),
+        "min_holdout_positives": TEMPORAL_MIN_HOLDOUT_LIKES,
+        "threshold_source": threshold_source,
+    }
+
+    # 7. Fit final classifier on all training-eligible Samples, only after the
+    # temporal evaluation above has been recorded.
     final_classifier = LogisticRegression(
         class_weight=best_weight_param,
         C=best_C,
@@ -483,23 +647,49 @@ def train_taste_classifier(
     )
     final_classifier.fit(X, y)
 
+    tuning_section = {
+        "evaluation_type": eval_type,
+        "folds": n_splits if eval_type == "stratified_cv" else None,
+        "tuning_limited": tuning_limited,
+        "pr_auc": round(pr_auc_score, 4),
+        "average_precision": round(ap_score, 4),
+        "recall": tuning_at_threshold["recall"],
+        "precision": tuning_at_threshold["precision"],
+        "f2_score": tuning_at_threshold["f2_score"],
+        "decision_threshold": round(calibrated_threshold, 2),
+        "confusion_matrix": tuning_at_threshold["confusion_matrix"],
+        "dev_sample_count": n_dev,
+        "dev_positive_count": dev_pos,
+        "dev_negative_count": dev_neg,
+        "dev_sample_ids": list(dev_ids) if dev_ids is not None else None,
+        "best_params": {
+            "C": best_C,
+            "class_weight": best_weight_key,
+        },
+        "tuning_summary": tuning_results,
+        "baselines": baselines,
+    }
+
     metrics = {
         "pr_auc": round(pr_auc_score, 4),
         "average_precision": round(ap_score, 4),
-        "recall": round(rec, 4),
-        "precision": round(prec, 4),
-        "f2_score": round(f2, 4),
+        "recall": tuning_at_threshold["recall"],
+        "precision": tuning_at_threshold["precision"],
+        "f2_score": tuning_at_threshold["f2_score"],
         "decision_threshold": round(calibrated_threshold, 2),
-        "confusion_matrix": {
-            "true_positives": tp,
-            "false_positives": fp,
-            "true_negatives": tn,
-            "false_negatives": fn,
-        },
+        "confusion_matrix": tuning_at_threshold["confusion_matrix"],
         "evaluation_type": eval_type,
         "folds": n_splits if eval_type == "stratified_cv" else None,
+        "tuning": tuning_section,
+        "temporal_holdout": temporal_holdout,
         "holdout": holdout_metrics,
         "generalization_warning": generalization_warning,
+        "effectiveness": effectiveness,
+        "warning_active": warning_active,
+        "warning_reasons": list(warning_reasons),
+        "threshold_source": threshold_source,
+        "training_eligible": dict(training_eligible_counts),
+        "eval_boundary": dict(eval_boundary),
         "best_params": {
             "C": best_C,
             "class_weight": best_weight_key,
@@ -533,17 +723,26 @@ def train_taste_classifier(
         "mean_centroid_distance": mean_cent_dist,
     }
 
-    # Save model artifact
+    # Save model artifact (temporal boundary, effectiveness state, threshold
+    # provenance, and training-eligibility counts live inside metrics; cached
+    # development and holdout scores support threshold updates without refit).
     model_payload = {
         "classifier": final_classifier,
         "decision_threshold": calibrated_threshold,
+        "threshold_source": threshold_source,
         "metrics": metrics,
         "sample_count": sample_count,
         "positive_count": positive_count,
         "negative_count": negative_count,
+        "training_eligible": dict(training_eligible_counts),
+        "eval_boundary": dict(eval_boundary),
+        "dev_sample_ids": list(dev_ids) if dev_ids is not None else None,
+        "holdout_sample_ids": list(holdout_ids) if holdout_ids is not None else None,
         "oof_probabilities": oof_probabilities.tolist(),
         "y_oof": y_dev.tolist(),
         "oof_score_map": oof_score_map,
+        "holdout_probabilities": holdout_probabilities,
+        "y_holdout": y_holdout_list,
         "reference_embedding": v_ref.tolist(),
         "reference_type": ref_type,
         "reference_source": ref_source,
@@ -592,19 +791,38 @@ def save_classifier_json(payload: dict[str, Any], target_path: Path | str) -> No
     if isinstance(ref_emb, np.ndarray):
         ref_emb = ref_emb.tolist()
 
+    holdout_probs = payload.get("holdout_probabilities", [])
+    if isinstance(holdout_probs, np.ndarray):
+        holdout_probs = holdout_probs.tolist()
+
+    y_holdout = payload.get("y_holdout", [])
+    if isinstance(y_holdout, np.ndarray):
+        y_holdout = y_holdout.tolist()
+
     serializable = {
         "format_version": "1.0",
         "coefficients": coefficients,
         "intercept": intercept,
         "classes": classes,
         "decision_threshold": float(payload.get("decision_threshold", DEFAULT_DECISION_THRESHOLD)),
+        "threshold_source": payload.get("threshold_source", "calibrated"),
         "metrics": payload.get("metrics", {}),
         "sample_count": int(payload.get("sample_count", 0)),
         "positive_count": int(payload.get("positive_count", 0)),
         "negative_count": int(payload.get("negative_count", 0)),
+        "training_eligible": payload.get("training_eligible", {
+            "sample_count": int(payload.get("sample_count", 0)),
+            "positive_count": int(payload.get("positive_count", 0)),
+            "negative_count": int(payload.get("negative_count", 0)),
+        }),
+        "eval_boundary": payload.get("eval_boundary"),
+        "dev_sample_ids": payload.get("dev_sample_ids"),
+        "holdout_sample_ids": payload.get("holdout_sample_ids"),
         "oof_probabilities": oof_probs,
         "y_oof": y_oof,
         "oof_score_map": {str(k): float(v) for k, v in payload.get("oof_score_map", {}).items()},
+        "holdout_probabilities": holdout_probs,
+        "y_holdout": y_holdout,
         "reference_embedding": ref_emb,
         "reference_type": payload.get("reference_type", "text"),
         "reference_source": payload.get("reference_source", DEFAULT_ZERO_SHOT_PROMPT),
@@ -654,7 +872,7 @@ def update_decision_threshold(
 
     clamped_threshold = float(round(float(np.clip(new_threshold, 0.05, 0.95)), 2))
 
-    # Prefer cached out-of-fold predictions to prevent in-sample leakage
+    # Prefer cached development-partition predictions to prevent in-sample leakage
     if "oof_probabilities" in model_data and "y_oof" in model_data:
         probabilities = np.array(model_data["oof_probabilities"], dtype=np.float32)
         y_eval = np.array(model_data["y_oof"], dtype=np.int32)
@@ -674,40 +892,113 @@ def update_decision_threshold(
     pr_auc_score = float(auc(recalls, precisions)) if len(recalls) > 1 else 0.0
     ap_score = float(average_precision_score(y_eval, probabilities)) if len(np.unique(y_eval)) > 1 else 0.0
 
-    binary_preds = (probabilities >= clamped_threshold).astype(int)
-    tp = int(np.sum((binary_preds == 1) & (y_eval == 1)))
-    fp = int(np.sum((binary_preds == 1) & (y_eval == 0)))
-    tn = int(np.sum((binary_preds == 0) & (y_eval == 0)))
-    fn = int(np.sum((binary_preds == 0) & (y_eval == 1)))
-
-    rec = float(tp / (tp + fn)) if (tp + fn) > 0 else 0.0
-    prec = float(tp / (tp + fp)) if (tp + fp) > 0 else 0.0
-    f2 = float(fbeta_score(y_eval, binary_preds, beta=2, zero_division=0))
+    tuning_at_threshold = _threshold_metrics_at(y_eval, probabilities, clamped_threshold)
 
     existing_metrics = model_data.get("metrics", {})
+
+    # Recompute temporal effectiveness at the new threshold from cached holdout
+    # scores so the effectiveness warning stays honest after manual tuning.
+    temporal_holdout = existing_metrics.get("temporal_holdout")
+    holdout_probs_cached = model_data.get("holdout_probabilities")
+    y_holdout_cached = model_data.get("y_holdout")
+    warning_reasons: list[str] = []
+    if (
+        isinstance(temporal_holdout, dict)
+        and temporal_holdout.get("status") == "available"
+        and holdout_probs_cached is not None
+        and y_holdout_cached is not None
+        and len(holdout_probs_cached) == len(y_holdout_cached)
+        and len(y_holdout_cached) > 0
+    ):
+        y_h = np.array(y_holdout_cached, dtype=np.int32)
+        p_h = np.array(holdout_probs_cached, dtype=np.float32)
+        h_precisions, h_recalls, _ = precision_recall_curve(y_h, p_h)
+        h_pr_auc = float(auc(h_recalls, h_precisions)) if len(h_recalls) > 1 else 0.0
+        h_ap = float(average_precision_score(y_h, p_h)) if len(np.unique(y_h)) > 1 else 0.0
+        h_at_threshold = _threshold_metrics_at(y_h, p_h, clamped_threshold)
+        temporal_holdout = {
+            **temporal_holdout,
+            "pr_auc": round(h_pr_auc, 4),
+            "average_precision": round(h_ap, 4),
+            "recall": h_at_threshold["recall"],
+            "precision": h_at_threshold["precision"],
+            "f2_score": h_at_threshold["f2_score"],
+            "confusion_matrix": h_at_threshold["confusion_matrix"],
+        }
+        holdout_pos = int(temporal_holdout.get("positive_count", int(np.sum(y_h == 1))))
+        if float(h_at_threshold["recall"]) < EFFECTIVENESS_RECALL_TARGET:
+            warning_reasons.append("recall_below_target")
+        if float(h_at_threshold["precision"]) < EFFECTIVENESS_PRECISION_TARGET:
+            warning_reasons.append("precision_below_target")
+        if holdout_pos < TEMPORAL_MIN_HOLDOUT_LIKES:
+            warning_reasons.append("holdout_likes_below_minimum")
+        effectiveness_status = "meets_target" if not warning_reasons else "below_target"
+        holdout_metrics = dict(temporal_holdout)
+    else:
+        if isinstance(temporal_holdout, dict):
+            prior_reasons = temporal_holdout.get("reasons") or existing_metrics.get("warning_reasons") or []
+            warning_reasons = list(prior_reasons)
+            if "temporal_evaluation_unavailable" not in warning_reasons:
+                warning_reasons.insert(0, "temporal_evaluation_unavailable")
+            temporal_holdout = dict(temporal_holdout)
+        else:
+            warning_reasons = ["temporal_evaluation_unavailable"]
+            temporal_holdout = {
+                "status": "temporal_evaluation_unavailable",
+                "reasons": list(warning_reasons),
+            }
+        effectiveness_status = "temporal_evaluation_unavailable"
+        holdout_metrics = None
+
+    warning_active = len(warning_reasons) > 0
+
+    existing_tuning = existing_metrics.get("tuning", {})
+    tuning_section = {
+        **existing_tuning,
+        "pr_auc": round(pr_auc_score, 4),
+        "average_precision": round(ap_score, 4),
+        "recall": tuning_at_threshold["recall"],
+        "precision": tuning_at_threshold["precision"],
+        "f2_score": tuning_at_threshold["f2_score"],
+        "decision_threshold": clamped_threshold,
+        "confusion_matrix": tuning_at_threshold["confusion_matrix"],
+    }
+
     metrics = {
         "pr_auc": round(pr_auc_score, 4),
         "average_precision": round(ap_score, 4),
-        "recall": round(rec, 4),
-        "precision": round(prec, 4),
-        "f2_score": round(f2, 4),
+        "recall": tuning_at_threshold["recall"],
+        "precision": tuning_at_threshold["precision"],
+        "f2_score": tuning_at_threshold["f2_score"],
         "decision_threshold": clamped_threshold,
-        "confusion_matrix": {
-            "true_positives": tp,
-            "false_positives": fp,
-            "true_negatives": tn,
-            "false_negatives": fn,
-        },
+        "confusion_matrix": tuning_at_threshold["confusion_matrix"],
         "evaluation_type": existing_metrics.get("evaluation_type", "out_of_fold"),
         "folds": existing_metrics.get("folds"),
-        "holdout": existing_metrics.get("holdout"),
-        "generalization_warning": existing_metrics.get("generalization_warning", False),
+        "tuning": tuning_section,
+        "temporal_holdout": temporal_holdout,
+        "holdout": holdout_metrics,
+        "generalization_warning": warning_active,
+        "effectiveness": {
+            "status": effectiveness_status,
+            "warning_active": warning_active,
+            "warning_reasons": list(warning_reasons),
+            "recall_target": EFFECTIVENESS_RECALL_TARGET,
+            "precision_target": EFFECTIVENESS_PRECISION_TARGET,
+            "min_holdout_positives": TEMPORAL_MIN_HOLDOUT_LIKES,
+            "threshold_source": "explicit",
+        },
+        "warning_active": warning_active,
+        "warning_reasons": list(warning_reasons),
+        "threshold_source": "explicit",
+        "training_eligible": existing_metrics.get("training_eligible"),
+        "eval_boundary": existing_metrics.get("eval_boundary"),
         "best_params": existing_metrics.get("best_params"),
         "tuning_summary": existing_metrics.get("tuning_summary"),
         "baselines": existing_metrics.get("baselines"),
     }
 
     model_data["decision_threshold"] = clamped_threshold
+    model_data["threshold_source"] = "explicit"
     model_data["metrics"] = metrics
 
     save_classifier_json(model_data, actual_model_path)

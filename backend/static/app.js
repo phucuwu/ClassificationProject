@@ -349,6 +349,8 @@ async function fetchMetrics() {
     document.getElementById("stat-pending-review").textContent = stats.pending_auto_review_count || 0;
     document.getElementById("counter-review").textContent = stats.pending_auto_review_count || 0;
     document.getElementById("counter-samples").textContent = stats.total_samples || 0;
+    const eligiblePill = document.getElementById("stat-eligible-samples");
+    if (eligiblePill) eligiblePill.textContent = stats.training_eligible_count || 0;
 
     // Model Status Indicator
     const statusText = document.getElementById("model-status-text");
@@ -364,9 +366,103 @@ async function fetchMetrics() {
 
     // Model Metrics Tab Display
     renderModelTab(model, stats);
+    renderTrustState(model, stats);
   } catch (err) {
     console.error("Error loading metrics:", err);
   }
+}
+
+// ----------------------------------------------------------------------------
+// Data-trust state: training-eligible counts, provenance, temporal vs tuning,
+// stale-model vs eligible state, and Full auto effectiveness warning.
+// ----------------------------------------------------------------------------
+
+const WARNING_REASON_LABELS = {
+  temporal_evaluation_unavailable: "Temporal evaluation unavailable",
+  holdout_disabled: "Holdout disabled (ratio 0)",
+  holdout_size_zero: "Holdout empty for this collection size",
+  holdout_missing_positive_class: "Holdout has no Likes",
+  holdout_missing_negative_class: "Holdout has no Dislikes",
+  holdout_likes_below_minimum: "Holdout Likes below 30",
+  recall_below_target: "Recall below 0.80",
+  precision_below_target: "Precision below 0.60",
+  legacy_artifact_missing_temporal_evaluation: "Saved model predates temporal evaluation",
+  model_not_trained: "Model not trained yet",
+};
+
+function describeWarningReason(reason) {
+  return WARNING_REASON_LABELS[reason] || reason;
+}
+
+function provenanceBadgeHtml(provenance) {
+  const prov = provenance || "unknown";
+  const cls = `prov-${String(prov).replace(/[^a-z_]/g, "")}`;
+  return `<span class="provenance-badge ${cls}" title="Label provenance: ${prov}">${prov}</span>`;
+}
+
+function renderTrustState(model, stats) {
+  const staleBanner = document.getElementById("stale-model-banner");
+  const warnBanner = document.getElementById("effectiveness-warning-banner");
+  const trustMeta = document.getElementById("model-trust-meta");
+  if (!staleBanner || !warnBanner || !trustMeta) return;
+
+  if (!model.model_loaded) {
+    staleBanner.classList.add("hidden");
+    warnBanner.classList.add("hidden");
+    const eligible = stats.training_eligible_count || 0;
+    trustMeta.innerHTML = `
+      <div class="trust-meta-row"><span class="trust-meta-label">Training-eligible Samples:</span>
+      <span class="trust-meta-val">${eligible} (${stats.training_eligible_positive_count || 0} Likes / ${stats.training_eligible_negative_count || 0} Dislikes)</span></div>
+      <div class="trust-meta-note">Train a model to record a temporal effectiveness evaluation.</div>
+    `;
+    return;
+  }
+
+  // Stale-model vs eligible-Database-state banner
+  if (model.stale_model) {
+    staleBanner.className = "trust-banner stale";
+    staleBanner.innerHTML = `<strong>⚠ Stale model:</strong> ${escapeHtml(model.stale_reason || "saved model does not match the current training-eligible collection")}. Retrain before trusting Full auto decisions.`;
+  } else {
+    staleBanner.className = "trust-banner ok";
+    const trainedCount = (model.training_eligible && model.training_eligible.sample_count) || 0;
+    staleBanner.innerHTML = `<strong>✓ Model current:</strong> trained on ${trainedCount} training-eligible Samples, matching the Dataset database.`;
+  }
+
+  // Temporal effectiveness warning banner (source of Full auto warning state)
+  const eff = model.effectiveness || {};
+  const reasons = model.warning_reasons || eff.warning_reasons || [];
+  if (model.warning_active || eff.warning_active) {
+    warnBanner.className = "trust-banner warning";
+    const reasonText = reasons.map(describeWarningReason).join("; ");
+    warnBanner.innerHTML = `<strong>⚠ Full auto effectiveness warning (${escapeHtml(eff.status || "unknown")}):</strong> ${escapeHtml(reasonText)}. Full auto remains available but requires explicit acknowledgement in the userscript.`;
+  } else {
+    warnBanner.className = "trust-banner ok";
+    warnBanner.innerHTML = `<strong>✓ Temporal effectiveness meets target:</strong> holdout recall ≥ 0.80 and precision ≥ 0.60 with at least 30 Likes.`;
+  }
+
+  // Trust metadata: eligible counts, provenance, threshold source, eval boundary
+  const prov = stats.provenance_counts || {};
+  const boundary = (model.metrics && (model.metrics.eval_boundary || (model.metrics.temporal_holdout && model.metrics.temporal_holdout.eval_boundary))) || {};
+  const trainedEligible = model.training_eligible || {};
+  const thresholdSrc = model.threshold_source || ((model.metrics && model.metrics.threshold_source) || "unknown");
+  const boundaryText = boundary.holdout_min_id !== undefined && boundary.holdout_min_id !== null
+    ? `dev IDs ≤ #${boundary.dev_max_id}, holdout IDs ≥ #${boundary.holdout_min_id} (${boundary.holdout_size || 0} Samples)`
+    : "no temporal boundary recorded";
+  trustMeta.innerHTML = `
+    <div class="trust-meta-grid">
+      <div class="trust-meta-row"><span class="trust-meta-label">Training-eligible (model):</span>
+        <span class="trust-meta-val">${trainedEligible.sample_count || 0} (${trainedEligible.positive_count || 0} Likes / ${trainedEligible.negative_count || 0} Dislikes)</span></div>
+      <div class="trust-meta-row"><span class="trust-meta-label">Training-eligible (database):</span>
+        <span class="trust-meta-val">${stats.training_eligible_count || 0} (${stats.training_eligible_positive_count || 0} Likes / ${stats.training_eligible_negative_count || 0} Dislikes)</span></div>
+      <div class="trust-meta-row"><span class="trust-meta-label">Provenance:</span>
+        <span class="trust-meta-val">manual_rating ${prov.manual_rating || 0} · supervised_confirmation ${prov.supervised_confirmation || 0} · review_confirmation ${prov.review_confirmation || 0} · auto_decision ${prov.auto_decision || 0}</span></div>
+      <div class="trust-meta-row"><span class="trust-meta-label">Threshold source:</span>
+        <span class="trust-meta-val">${escapeHtml(String(thresholdSrc))} (θ = ${model.decision_threshold})</span></div>
+      <div class="trust-meta-row"><span class="trust-meta-label">Temporal boundary:</span>
+        <span class="trust-meta-val">${escapeHtml(boundaryText)}</span></div>
+    </div>
+    <div class="trust-meta-note">Development cross-validation tunes parameters only. The temporal holdout is the only effectiveness report.</div>
+  `;
 }
 
 async function fetchReviewQueue() {
@@ -525,6 +621,9 @@ function renderReviewGrid() {
           <span>ID: #${sample.id}</span>
           <span>Mode: ${sample.mode}</span>
         </div>
+        <div class="card-meta-row">
+          ${provenanceBadgeHtml(sample.label_provenance)}
+        </div>
         <button class="label-toggle-btn ${isLike ? 'is-like' : 'is-dislike'}" data-id="${sample.id}">
           <span>${isLike ? '★ Liked' : '✕ Disliked'}</span>
           <span style="font-size: 0.72rem; opacity: 0.8;">Click to Toggle</span>
@@ -639,6 +738,9 @@ function renderSamplesGrid() {
         <div class="card-meta-row">
           <span>Reviewed: ${sample.reviewed === 1 ? 'Yes' : 'Pending'}</span>
           <span>Score: ${sample.prediction_score !== null ? (sample.prediction_score * 100).toFixed(0) + '%' : '-'}</span>
+        </div>
+        <div class="card-meta-row">
+          ${provenanceBadgeHtml(sample.label_provenance)}
         </div>
         ${outlierActionHtml}
       </div>
@@ -839,7 +941,7 @@ function updateMetricsDisplay(m, stats = {}) {
 
   if (kpiGrid) {
     kpiGrid.innerHTML = `
-      <!-- KPI 1: PR-AUC -->
+      <div class="kpi-section-note" style="grid-column: span 4;">Development tuning metrics (cross-validation on the earlier prefix) — not the effectiveness report. See temporal effectiveness below.</div>
       <div class="kpi-card" style="--kpi-accent: #a855f7;">
         <div class="kpi-card-header">
           <span class="kpi-title">PR-AUC Score</span>
@@ -921,7 +1023,7 @@ function updateMetricsDisplay(m, stats = {}) {
           <div class="baselines-title">
             <span>📊 Evaluation Baselines Benchmark</span>
           </div>
-          <span class="baselines-tuned-chip" title="Hyperparameters tuned via Stratified Cross-Validation on PR-AUC">Tuned: ${bpText}</span>
+          <span class="baselines-tuned-chip" title="Hyperparameters tuned on the development prefix via cross-validation; tuning only, not effectiveness">Dev tuning: ${bpText}</span>
         </div>
         <div class="baselines-list">
           <!-- 1. Random Guess -->
@@ -998,19 +1100,26 @@ function updateMetricsDisplay(m, stats = {}) {
     }
   }
 
-  // Holdout Verification Section
+  // Temporal Effectiveness Section (the only effectiveness report)
   if (holdoutContainer) {
-    if (m.holdout) {
-      const h = m.holdout;
-      const isWarn = m.generalization_warning;
-      const badgeHtml = isWarn
-        ? `<span class="holdout-badge warn">⚠ Generalization Drop</span>`
-        : `<span class="holdout-badge pass">✓ Stratified Holdout Verified</span>`;
+    const temporal = m.temporal_holdout || null;
+    const eff = m.effectiveness || {};
+    const warnActive = m.warning_active || eff.warning_active;
+    if (temporal && temporal.status === "available") {
+      const h = temporal;
+      const badgeHtml = warnActive
+        ? `<span class="holdout-badge warn">⚠ Below Target</span>`
+        : `<span class="holdout-badge pass">✓ Meets Target</span>`;
+      const warnReasons = (m.warning_reasons || eff.warning_reasons || []).map(describeWarningReason).join("; ");
+      const boundary = h.eval_boundary || {};
+      const boundaryText = boundary.holdout_min_id !== undefined && boundary.holdout_min_id !== null
+        ? `Newest suffix (IDs ≥ #${boundary.holdout_min_id}) held out after dev IDs ≤ #${boundary.dev_max_id}; final classifier fit on all eligible Samples afterwards.`
+        : `Evaluated on the newest temporal suffix before final full-eligible fit.`;
 
       holdoutContainer.innerHTML = `
         <div class="holdout-header">
           <div class="holdout-title">
-            <span>🛡️ Generalization Holdout Verification</span>
+            <span>🛡️ Temporal Effectiveness (Newest Holdout)</span>
           </div>
           ${badgeHtml}
         </div>
@@ -1021,11 +1130,11 @@ function updateMetricsDisplay(m, stats = {}) {
           </div>
           <div class="holdout-stat">
             <div class="holdout-stat-val" style="color: #34d399;">${((h.recall || 0) * 100).toFixed(0)}%</div>
-            <div class="holdout-stat-lbl">Holdout Recall</div>
+            <div class="holdout-stat-lbl">Holdout Recall (target ≥ 80%)</div>
           </div>
           <div class="holdout-stat">
             <div class="holdout-stat-val" style="color: #38bdf8;">${((h.precision || 0) * 100).toFixed(0)}%</div>
-            <div class="holdout-stat-lbl">Holdout Prec.</div>
+            <div class="holdout-stat-lbl">Holdout Prec. (target ≥ 60%)</div>
           </div>
           <div class="holdout-stat">
             <div class="holdout-stat-val" style="color: #c084fc;">${h.f2_score !== undefined ? h.f2_score.toFixed(3) : '--'}</div>
@@ -1033,19 +1142,21 @@ function updateMetricsDisplay(m, stats = {}) {
           </div>
         </div>
         <div class="holdout-footer-text">
-          Evaluated on <strong>${h.sample_count} stratified holdout samples</strong> (${h.positive_count} Likes, ${h.negative_count} Dislikes) before final full-dataset fit.
+          Evaluated on <strong>${h.sample_count} newest temporal-holdout Samples</strong> (${h.positive_count} Likes, ${h.negative_count} Dislikes). ${warnActive ? `Warning: <strong>${escapeHtml(warnReasons)}</strong>. ` : ""}${escapeHtml(boundaryText)}
         </div>
       `;
     } else {
+      const reasons = (temporal && temporal.reasons) || m.warning_reasons || eff.warning_reasons || ["temporal_evaluation_unavailable"];
+      const reasonText = reasons.map(describeWarningReason).join("; ");
       holdoutContainer.innerHTML = `
         <div class="holdout-header">
           <div class="holdout-title">
-            <span>🛡️ Generalization Holdout Verification</span>
+            <span>🛡️ Temporal Effectiveness (Newest Holdout)</span>
           </div>
-          <span class="holdout-badge none">Full Dataset CV</span>
+          <span class="holdout-badge none">Evaluation Unavailable</span>
         </div>
         <div class="holdout-footer-text">
-          Stratified cross-validation evaluated across all available labeled samples. Stratified holdout test partitioning activates when both Likes and Dislikes have at least 2 samples.
+          No valid temporal holdout: <strong>${escapeHtml(reasonText)}</strong>. The newest suffix must retain both classes with at least 30 Likes; no random split is substituted. Development tuning metrics above are not an effectiveness signal.
         </div>
       `;
     }
@@ -1073,7 +1184,13 @@ function updateMetricsDisplay(m, stats = {}) {
   // Update Matrix Tag
   const matrixTag = document.getElementById("matrix-eval-tag");
   if (matrixTag) {
-    matrixTag.textContent = m.evaluation_type === "stratified_cv" ? `${m.folds || 5}-Fold OOF` : "In-Sample";
+    if (m.evaluation_type === "stratified_cv") {
+      matrixTag.textContent = `${m.folds || 5}-Fold Dev Tuning`;
+    } else if (m.evaluation_type === "limited_tuning_data") {
+      matrixTag.textContent = "Limited Tuning Data";
+    } else {
+      matrixTag.textContent = "Dev Tuning";
+    }
   }
 
   // Update Rates Bar
@@ -1143,17 +1260,21 @@ function renderModelTab(model, stats) {
     heroStatusText.textContent = "MODEL ONLINE";
   }
   if (heroEvalChip) {
-    const folds = model.metrics.folds || 5;
-    heroEvalChip.textContent = model.metrics.evaluation_type === "stratified_cv" ? `Stratified ${folds}-Fold OOF CV` : "In-Sample Evaluation";
+    const temporal = model.metrics.temporal_holdout || null;
+    if (temporal && temporal.status === "available") {
+      heroEvalChip.textContent = `Temporal Holdout (${temporal.positive_count} Likes / ${temporal.sample_count} Samples)`;
+    } else {
+      heroEvalChip.textContent = "Temporal Evaluation Unavailable";
+    }
   }
   const heroTuningChip = document.getElementById("hero-tuning-chip");
   if (heroTuningChip) {
     const bp = model.metrics.best_params;
     if (bp) {
-      heroTuningChip.textContent = `Tuning: C=${bp.C}, ${bp.class_weight}`;
+      heroTuningChip.textContent = `Dev tuning: C=${bp.C}, ${bp.class_weight}`;
       heroTuningChip.style.display = "inline-flex";
     } else {
-      heroTuningChip.textContent = "Tuning: C=1.0, balanced";
+      heroTuningChip.textContent = "Dev tuning: C=1.0, balanced";
       heroTuningChip.style.display = "inline-flex";
     }
   }

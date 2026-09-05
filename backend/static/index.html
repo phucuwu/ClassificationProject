@@ -39,6 +39,10 @@
           <span class="pill-label">Pending Review:</span>
           <span class="pill-value text-warning" id="stat-pending-review">0</span>
         </div>
+        <div class="metric-pill">
+          <span class="pill-label">Training-Eligible:</span>
+          <span class="pill-value" id="stat-eligible-samples">0</span>
+        </div>
       </div>
     </header>
 
@@ -292,6 +296,15 @@
           </div>
         </div>
 
+        <!-- Data-trust banners: stale model vs eligible state, effectiveness warning -->
+        <div id="stale-model-banner" class="trust-banner stale hidden" role="status"></div>
+        <div id="effectiveness-warning-banner" class="trust-banner warning hidden" role="alert"></div>
+
+        <!-- Training-eligible counts, provenance, threshold source, eval boundary -->
+        <div class="trust-meta-card" id="model-trust-meta">
+          <!-- Dynamically populated trust metadata -->
+        </div>
+
         <!-- Top KPI Cards Grid -->
         <div class="model-kpi-grid" id="model-kpi-grid">
           <!-- Dynamically populated KPI cards -->
@@ -303,7 +316,7 @@
             <div class="card-header-flex">
               <div>
                 <h3>Generalization & Retraining Studio</h3>
-                <p class="subtext">Out-of-fold validation, holdout generalization verification, and calibration controls.</p>
+                <p class="subtext">Development-partition tuning, temporal-holdout effectiveness, and calibration controls.</p>
               </div>
             </div>
 
@@ -312,9 +325,9 @@
               <!-- Dynamically populated evaluation baselines benchmark -->
             </div>
 
-            <!-- Holdout Verification Box -->
+            <!-- Temporal Effectiveness Box (model-effectiveness report) -->
             <div class="holdout-card-section" id="holdout-summary-container">
-              <!-- Dynamically populated holdout metrics -->
+              <!-- Dynamically populated temporal effectiveness metrics -->
             </div>
 
             <hr class="card-divider">
@@ -349,7 +362,7 @@
                     <input type="range" id="input-holdout-ratio" class="slider-input" min="0.0" max="0.30" step="0.05" value="0.15">
                   </div>
                   <div class="holdout-hint-text">
-                    Reserves a stratified split to verify generalization on unseen samples before final model refit.
+                    Reserves the newest temporal suffix for the effectiveness holdout; the earlier prefix tunes parameters. No random split is substituted when the holdout cannot meet both classes and 30 Likes.
                   </div>
                 </div>
 
@@ -392,7 +405,7 @@
             <div class="card-header-flex">
               <div>
                 <h3>Decision Threshold & Confusion Matrix</h3>
-                <p class="subtext">Tune probability cutoff θ with real-time out-of-fold confusion matrix recalculation.</p>
+                <p class="subtext">Tune probability cutoff θ with real-time development-partition confusion matrix recalculation. Tuning metrics are not the effectiveness report.</p>
               </div>
             </div>
 

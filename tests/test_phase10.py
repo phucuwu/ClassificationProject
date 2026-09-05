@@ -29,6 +29,7 @@ import backend.model as model_mod
 from backend.app import app
 from backend.model import (
     DEFAULT_DECISION_THRESHOLD,
+    EFFECTIVENESS_RECALL_TARGET,
     load_classifier,
     predict_taste,
     save_classifier_json,
@@ -186,6 +187,116 @@ def test_update_decision_threshold_json():
         assert loaded["metrics"]["decision_threshold"] == 0.45
 
 
+def test_temporal_artifact_shape_for_phase4_retraining():
+    """Verify the saved artifact carries everything Phase 4 retraining needs.
+
+    Boundary, holdout counts, warning reasons, threshold source, and
+    training-eligible counts must survive a save/load round-trip in raw JSON.
+    """
+    np.random.seed(31)
+    n_total = 60
+    X = np.random.randn(n_total, 768).astype(np.float32)
+    X /= np.linalg.norm(X, axis=1, keepdims=True)
+    X[::5] += 0.8
+    y = np.zeros(n_total, dtype=np.int32)
+    y[::5] = 1
+    sample_ids = list(range(7000, 7060))
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        json_path = Path(tmpdir) / "model.json"
+        res = train_taste_classifier(X, y, sample_ids=sample_ids, holdout_ratio=0.2, model_path=json_path)
+        assert res["status"] == "trained"
+
+        with open(json_path, "r", encoding="utf-8") as f:
+            raw = json.load(f)
+
+        # Top-level Phase 4 retraining fields
+        for key in (
+            "threshold_source",
+            "training_eligible",
+            "eval_boundary",
+            "dev_sample_ids",
+            "holdout_sample_ids",
+            "holdout_probabilities",
+            "y_holdout",
+        ):
+            assert key in raw, f"artifact missing {key}"
+
+        assert raw["training_eligible"] == {"sample_count": 60, "positive_count": 12, "negative_count": 48}
+        assert raw["eval_boundary"]["dev_size"] == 48
+        assert raw["eval_boundary"]["holdout_size"] == 12
+        assert raw["eval_boundary"]["dev_max_id"] == 7047
+        assert raw["eval_boundary"]["holdout_min_id"] == 7048
+        assert raw["dev_sample_ids"] == list(range(7000, 7048))
+        assert raw["holdout_sample_ids"] == list(range(7048, 7060))
+
+        m = raw["metrics"]
+        for key in (
+            "tuning",
+            "temporal_holdout",
+            "effectiveness",
+            "warning_active",
+            "warning_reasons",
+            "threshold_source",
+            "training_eligible",
+            "eval_boundary",
+        ):
+            assert key in m, f"metrics missing {key}"
+        assert m["temporal_holdout"]["status"] == "temporal_evaluation_unavailable"
+        assert "temporal_evaluation_unavailable" in m["warning_reasons"]
+        assert m["effectiveness"]["warning_active"] is True
+        # Tuning stays separate from effectiveness
+        assert m["tuning"]["dev_sample_count"] == 48
+        assert m["tuning"]["evaluation_type"] == "stratified_cv"
+
+        # Round-trip through load_classifier preserves the same shape
+        loaded = load_classifier(json_path)
+        assert loaded["training_eligible"]["sample_count"] == 60
+        assert loaded["eval_boundary"]["holdout_min_id"] == 7048
+        assert loaded["threshold_source"] == raw["threshold_source"]
+
+
+def test_threshold_update_recomputes_temporal_effectiveness():
+    """Verify manual threshold updates re-score the cached temporal holdout."""
+    np.random.seed(37)
+    n_total = 80
+    X = np.random.randn(n_total, 768).astype(np.float32)
+    pos_mask = np.zeros(n_total, dtype=bool)
+    pos_mask[::4] = True
+    X[pos_mask] += 2.0
+    X /= np.linalg.norm(X, axis=1, keepdims=True)
+    y = pos_mask.astype(np.int32)
+    sample_ids = list(range(8000, 8080))
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        json_path = Path(tmpdir) / "model.json"
+        res = train_taste_classifier(
+            X, y, sample_ids=sample_ids, holdout_ratio=0.25, min_holdout_positives=5, model_path=json_path
+        )
+        assert res["status"] == "trained"
+        assert res["metrics"]["temporal_holdout"]["status"] == "available"
+        assert res["metrics"]["temporal_holdout"]["positive_count"] == 5
+
+        # Push the threshold to an extreme: holdout recall must collapse and the
+        # warning must recompute from the cached holdout scores.
+        upd = update_decision_threshold(0.95, model_path=json_path)
+        assert upd["success"] is True
+        um = upd["metrics"]
+        assert um["threshold_source"] == "explicit"
+        assert um["temporal_holdout"]["status"] == "available"
+        assert um["temporal_holdout"]["recall"] < EFFECTIVENESS_RECALL_TARGET
+        assert "recall_below_target" in um["warning_reasons"]
+        assert um["warning_active"] is True
+        assert um["effectiveness"]["status"] == "below_target"
+        # Boundary and eligibility survive the update
+        assert um["eval_boundary"]["holdout_min_id"] == 8060
+        assert um["training_eligible"] == {"sample_count": 80, "positive_count": 20, "negative_count": 60}
+
+        loaded = load_classifier(json_path)
+        assert loaded["decision_threshold"] == 0.95
+        assert loaded["metrics"]["warning_active"] is True
+
+
 def test_backbone_benchmark_cv_engine():
     """Verify evaluate_backbone_cv correctly scores feature matrices with cross-validation."""
     X, y = _generate_synthetic_dataset(n_samples=40, pos_ratio=0.15, dim=768)
@@ -230,6 +341,10 @@ def run_all_tests():
     test_json_model_serialization_and_deserialization()
     print("Running test_legacy_pickle_migration...")
     test_legacy_pickle_migration()
+    print("Running test_temporal_artifact_shape_for_phase4_retraining...")
+    test_temporal_artifact_shape_for_phase4_retraining()
+    print("Running test_threshold_update_recomputes_temporal_effectiveness...")
+    test_threshold_update_recomputes_temporal_effectiveness()
     print("Running test_vectorized_inference_parity...")
     test_vectorized_inference_parity()
     print("Running test_update_decision_threshold_json...")

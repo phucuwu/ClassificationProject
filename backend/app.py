@@ -1,6 +1,6 @@
 """FastAPI backend server for the local art taste classifier.
 
-Provides REST endpoints for sample recording, prediction inference, desktop screen capture,
+Provides REST endpoints for sample recording, prediction inference,
 classifier retraining, review queue management, and dataset metrics.
 """
 
@@ -10,11 +10,12 @@ import base64
 import hashlib
 import io
 import json
+import math
 import os
 import threading
 import warnings
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
 
 # Filter third-party library deprecation notices
 os.environ.setdefault("HF_HUB_DISABLE_IMPLICIT_TOKEN", "1")
@@ -22,14 +23,11 @@ warnings.filterwarnings("ignore", category=DeprecationWarning, module="starlette
 warnings.filterwarnings("ignore", category=DeprecationWarning, module="fastapi.*")
 warnings.filterwarnings("ignore", message=".*unauthenticated requests to the HF Hub.*")
 
-import mss
 from fastapi import FastAPI, HTTPException, Query, Request, status
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 from PIL import Image
-from pydantic import BaseModel, Field
-
-import random
+from pydantic import BaseModel, Field, field_validator
 
 import numpy as np
 
@@ -41,7 +39,6 @@ from backend.database import (
     init_db,
     insert_sample,
     find_near_duplicate,
-    update_sample_record,
     load_training_matrix,
     load_embedding_scatter_data,
     update_sample_reviews,
@@ -51,6 +48,9 @@ from sklearn.decomposition import PCA
 from sklearn.manifold import TSNE
 from backend.model import (
     DEFAULT_DECISION_THRESHOLD,
+    EFFECTIVENESS_PRECISION_TARGET,
+    EFFECTIVENESS_RECALL_TARGET,
+    TEMPORAL_MIN_HOLDOUT_LIKES,
     detect_positive_outliers,
     detect_negative_outliers,
     extract_vision_embedding,
@@ -111,10 +111,16 @@ app = FastAPI(
     lifespan=lifespan,
 )
 
-# Configure CORS to allow local browser userscripts and localhost web applications
+# Configure CORS to allow only the local Developer dashboard origin(s).
+# The Userscript communicates via GM_xmlhttpRequest (no CORS preflight); the
+# dashboard is served by this Backend server, so only its local origins are listed.
+LOCAL_DASHBOARD_ORIGINS = [
+    "http://localhost:8000",
+    "http://127.0.0.1:8000",
+]
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=LOCAL_DASHBOARD_ORIGINS,
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -170,12 +176,21 @@ class LogRequest(BaseModel):
 
 class RecordRequest(BaseModel):
     image_base64: str = Field(..., description="Base64 encoded image string or data URI.")
-    label: int | None = Field(None, description="1 for Like (positive class), 0 for Dislike, or null for unlabeled.")
-    mode: str = Field("manual", description="Operating mode: 'manual', 'supervised', or 'auto'.")
-    prediction_score: float | None = Field(None, description="Model prediction score P(Like) between 0.0 and 1.0.")
-    reviewed: int = Field(0, description="1 if confirmed by human, 0 if pending review.")
-    image_set_count: int | None = Field(None, description="Total photos detected in the active card's image set.")
-    negative_sample_rate: float = Field(0.05, ge=0.0, le=1.0, description="Audit rate for sampling automated negative decisions into review queue.")
+    label: Literal[0, 1] | None = Field(None, description="1 for Like (positive class), 0 for Dislike, or null for unlabeled.")
+    mode: Literal["manual", "supervised", "auto"] = Field("manual", description="Operating mode: 'manual', 'supervised', or 'auto'.")
+    prediction_score: float | None = Field(None, ge=0.0, le=1.0, description="Model prediction score P(Like) between 0.0 and 1.0.")
+    reviewed: Literal[0, 1] = Field(0, description="Caller review hint; the server derives review state from mode and ignores conflicting values.")
+    image_set_count: int | None = Field(None, ge=1, description="Total photos detected in the active card's image set.")
+    negative_sample_rate: float = Field(0.05, ge=0.0, le=1.0, description="Legacy audit-rate hint; ignored because every Full auto Sample stays unreviewed.")
+
+    @field_validator("prediction_score")
+    @classmethod
+    def _check_finite_score(cls, value: float | None) -> float | None:
+        if value is None:
+            return None
+        if not math.isfinite(value):
+            raise ValueError("prediction_score must be a finite float in [0.0, 1.0].")
+        return value
 
 
 class PredictRequest(BaseModel):
@@ -183,18 +198,12 @@ class PredictRequest(BaseModel):
     threshold: float | None = Field(None, description="Optional override for decision threshold.")
 
 
-class CaptureRequest(BaseModel):
-    x: int = Field(..., description="Top-left X coordinate on desktop screen.")
-    y: int = Field(..., description="Top-left Y coordinate on desktop screen.")
-    width: int = Field(..., description="Width of screen capture region in pixels.")
-    height: int = Field(..., description="Height of screen capture region in pixels.")
-
-
 class TrainRequest(BaseModel):
     target_recall: float | None = Field(None, description="Optional target recall rate for decision threshold calibration.")
     threshold: float | None = Field(None, description="Optional explicit threshold override.")
     min_recall_floor: float = Field(0.70, ge=0.05, le=0.95, description="Minimum recall floor for hybrid F2 threshold calibration.")
-    holdout_ratio: float = Field(0.15, ge=0.0, le=0.50, description="Fraction of most recent samples reserved for generalization holdout.")
+    holdout_ratio: float = Field(0.15, ge=0.0, le=0.50, description="Fraction of newest training-eligible samples reserved for the temporal holdout.")
+    min_holdout_positives: int = Field(30, ge=1, description="Minimum Positive-class (Like) count required for a valid temporal holdout.")
     baseline_prompt_text: str | None = Field(None, description="Optional custom prompt text for the zero-shot reference baseline.")
     baseline_image_base64: str | None = Field(None, description="Optional base64 exemplar image for the zero-shot reference baseline.")
     reset_baseline_to_default: bool = Field(False, description="Flag to reset the reference baseline back to the default text prompt.")
@@ -206,8 +215,8 @@ class ThresholdRequest(BaseModel):
 
 class ReviewUpdateItem(BaseModel):
     id: int = Field(..., description="Sample database identifier.")
-    label: int = Field(..., description="Updated label (1 for Like, 0 for Dislike).")
-    reviewed: int = Field(1, description="Review confirmation status flag.")
+    label: Literal[0, 1] = Field(..., description="Updated label (1 for Like, 0 for Dislike).")
+    reviewed: Literal[0, 1] = Field(1, description="Caller review hint; the server always persists reviewed=1 with review_confirmation provenance.")
 
 
 class ReviewRequest(BaseModel):
@@ -254,6 +263,98 @@ def _decode_and_save_image(image_base64: str) -> tuple[bytes, str, Path]:
         pil_image.save(file_path, format="JPEG", quality=95)
 
     return image_bytes, image_hash, file_path
+
+
+def _derive_record_provenance(mode: str) -> tuple[int, str]:
+    """Derive server-side review state and label provenance from the operating mode.
+
+    Every Full auto Sample persists as unreviewed ``auto_decision``. Manual and
+    confirmed Supervised-mode Samples persist as reviewed human-confirmed
+    Samples (``manual_rating`` / ``supervised_confirmation``).
+    """
+    if mode == "auto":
+        return 0, "auto_decision"
+    if mode == "supervised":
+        return 1, "supervised_confirmation"
+    return 1, "manual_rating"
+
+
+def _samples_has_provenance_column(db_path: Path | str | None = None) -> bool:
+    """Return True when the samples table carries the Phase 1 label_provenance column."""
+    conn = db.get_db_connection(db_path)
+    try:
+        columns = {row["name"] for row in conn.execute("PRAGMA table_info(samples);").fetchall()}
+        return "label_provenance" in columns
+    finally:
+        conn.close()
+
+
+def _fetch_sample_by_hash(image_hash: str, db_path: Path | str | None = None) -> dict[str, Any] | None:
+    """Fetch a Sample row by exact Primary-image hash.
+
+    Reads label_provenance when the Phase 1 column is present; otherwise derives
+    provenance locally from mode/reviewed without touching the schema.
+    """
+    conn = db.get_db_connection(db_path)
+    try:
+        columns = {row["name"] for row in conn.execute("PRAGMA table_info(samples);").fetchall()}
+        has_provenance = "label_provenance" in columns
+        selected = "id, image_hash, file_path, label, prediction_score, mode, reviewed"
+        if has_provenance:
+            selected += ", label_provenance"
+        cursor = conn.execute(
+            f"SELECT {selected} FROM samples WHERE image_hash = ?;",
+            (image_hash,),
+        )
+        row = cursor.fetchone()
+        if row is None:
+            return None
+        sample = dict(row)
+        if not has_provenance:
+            reviewed_status, provenance = _derive_record_provenance(str(sample.get("mode", "auto")))
+            if sample.get("reviewed") != reviewed_status:
+                provenance = "auto_decision"
+            sample["label_provenance"] = provenance
+        return sample
+    finally:
+        conn.close()
+
+
+def _insert_recorded_sample(
+    *,
+    image_hash: str,
+    file_path: str,
+    embedding: Any,
+    label: int | None,
+    mode: str,
+    prediction_score: float | None,
+    reviewed: int,
+    provenance: str,
+    db_path: Path | str | None = None,
+) -> int:
+    """Insert a Sample, persisting provenance when the column exists."""
+    if _samples_has_provenance_column(db_path):
+        return insert_sample(
+            image_hash=image_hash,
+            file_path=file_path,
+            embedding=embedding,
+            label=label,
+            mode=mode,
+            prediction_score=prediction_score,
+            reviewed=reviewed,
+            label_provenance=provenance,
+            db_path=db_path,
+        )
+    return insert_sample(
+        image_hash=image_hash,
+        file_path=file_path,
+        embedding=embedding,
+        label=label,
+        mode=mode,
+        prediction_score=prediction_score,
+        reviewed=reviewed,
+        db_path=db_path,
+    )
 
 
 def check_session_drift(db_path: Path | str | None = None, window_size: int = 100, min_window: int = 20) -> dict[str, Any] | None:
@@ -307,131 +408,145 @@ def check_session_drift(db_path: Path | str | None = None, window_size: int = 10
 
 @app.post("/api/record", status_code=status.HTTP_201_CREATED)
 def record_sample(payload: RecordRequest) -> dict[str, Any]:
-    """Ingest a sample with an image, label, and mode. Extracts and saves the vision embedding."""
+    """Ingest a Sample with an image, label, and operating mode.
+
+    The server derives review state and label provenance from the operating
+    mode: every Full auto Sample persists as unreviewed ``auto_decision``,
+    while Manual and confirmed Supervised-mode Samples persist as reviewed
+    human-confirmed Samples. Deduplication is limited to the exact
+    Primary-image hash; visual similarity is advisory only and never mutates
+    an existing Sample's label, mode, review state, or provenance.
+    """
     try:
         raw_str = payload.image_base64
         if "," in raw_str:
             raw_str = raw_str.split(",", 1)[1]
-        image_bytes = base64.b64decode(raw_str)
-        embedding = extract_vision_embedding(image_bytes)
+        try:
+            image_bytes = base64.b64decode(raw_str)
+        except Exception as exc:
+            raise HTTPException(
+                status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
+                detail=f"Invalid image_base64 payload: {str(exc)}",
+            ) from exc
+        if not image_bytes:
+            raise HTTPException(
+                status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
+                detail="Invalid image_base64 payload: empty image bytes.",
+            )
+        image_hash = hashlib.sha256(image_bytes).hexdigest()
 
-        # Determine reviewed status with negative sampling for full auto mode
-        reviewed_status = payload.reviewed
-        sampled_for_review = False
-        if payload.mode == "auto":
-            if payload.label == 1:
-                # All automated positive decisions enter review queue
-                reviewed_status = 0
-            elif payload.label == 0:
-                # Dislikes are sampled at negative_sample_rate (default 5%)
-                if random.random() < payload.negative_sample_rate:
-                    reviewed_status = 0
-                    sampled_for_review = True
-                else:
-                    reviewed_status = 1
+        # Server-side review state and label provenance; caller hints are ignored.
+        reviewed_status, provenance = _derive_record_provenance(payload.mode)
 
-        # Check for near-duplicate artwork before saving new image file or inserting row
-        near_dup = find_near_duplicate(embedding, threshold=0.98, db_path=db.DEFAULT_DB_PATH)
         label_str = "LIKE (1)" if payload.label == 1 else ("DISLIKE (0)" if payload.label == 0 else "UNLABELED")
         set_str = f" [Set: {payload.image_set_count} photos]" if payload.image_set_count and payload.image_set_count > 1 else ""
 
-        if near_dup is not None:
-            canonical_id = int(near_dup["id"])
-            target_label = payload.label
-            target_mode = payload.mode
-            target_reviewed = reviewed_status
-
-            # Protect verified human decisions from being overwritten by unreviewed automated guesses
-            if near_dup.get("reviewed") == 1 and payload.mode == "auto":
-                target_label = near_dup["label"]
-                target_mode = near_dup.get("mode", payload.mode)
-                target_reviewed = 1
-            elif target_label is None and near_dup.get("label") is not None:
-                target_label = near_dup["label"]
-
-            update_sample_record(
-                canonical_id,
-                label=target_label,
-                mode=target_mode,
-                prediction_score=payload.prediction_score,
-                reviewed=target_reviewed,
-                db_path=db.DEFAULT_DB_PATH,
-            )
-            sim_val = float(near_dup["similarity"])
-            final_label_str = "LIKE (1)" if target_label == 1 else ("DISLIKE (0)" if target_label == 0 else "UNLABELED")
+        # Exact Primary-image hash deduplication: no second row and no overwrite
+        # of a confirmed label, mode, review state, or provenance.
+        existing = _fetch_sample_by_hash(image_hash, db.DEFAULT_DB_PATH)
+        if existing is not None:
+            existing_id = int(existing["id"])
             add_activity_log(
                 "INFO",
-                "duplicate_consolidated",
-                f"Near-duplicate artwork detected (sim={sim_val:.4f} with #{canonical_id}): consolidated into sample #{canonical_id} as {final_label_str}{set_str}",
+                "exact_duplicate_ignored",
+                f"Exact Primary-image hash already recorded as Sample #{existing_id}; no second row created and confirmed label preserved{set_str}",
                 mode=payload.mode,
                 details={
-                    "id": canonical_id,
-                    "similarity": sim_val,
-                    "image_hash": near_dup["image_hash"],
-                    "label": target_label,
-                    "reviewed": target_reviewed,
-                    "original_label": near_dup["label"],
+                    "id": existing_id,
+                    "similarity": 1.0,
+                    "image_hash": image_hash,
+                    "label": existing["label"],
+                    "reviewed": existing["reviewed"],
+                    "label_provenance": existing.get("label_provenance"),
+                    "incoming_label": payload.label,
+                    "incoming_mode": payload.mode,
                     "image_set_count": payload.image_set_count,
                 },
             )
             check_session_drift(db_path=db.DEFAULT_DB_PATH)
             return {
-                "status": "consolidated",
-                "id": canonical_id,
-                "duplicate_of": canonical_id,
-                "similarity": sim_val,
-                "image_hash": near_dup["image_hash"],
-                "label": target_label,
-                "reviewed": target_reviewed,
+                "status": "duplicate",
+                "id": existing_id,
+                "duplicate_of": existing_id,
+                "similarity": 1.0,
+                "image_hash": image_hash,
+                "label": existing["label"],
+                "reviewed": existing["reviewed"],
+                "label_provenance": existing.get("label_provenance"),
+                "provenance": existing.get("label_provenance"),
             }
 
-        # If not a near-duplicate, save image to disk and insert new sample
-        _, image_hash, file_path = _decode_and_save_image(payload.image_base64)
-        rel_path = f"data/images/{image_hash}.jpg"
-        sample_id = insert_sample(
-            image_hash=image_hash,
+        embedding = extract_vision_embedding(image_bytes)
+
+        # Advisory visual-similarity signal: a non-identical Primary image with
+        # similarity >= 0.98 still creates a separate Sample and only logs a
+        # warning. It never mutates label, mode, review state, or provenance.
+        advisory = None
+        try:
+            advisory = find_near_duplicate(embedding, threshold=0.98, db_path=db.DEFAULT_DB_PATH)
+        except Exception:
+            advisory = None
+
+        # Save image to disk and insert the new separate Sample.
+        _, saved_hash, file_path = _decode_and_save_image(payload.image_base64)
+        rel_path = f"data/images/{saved_hash}.jpg"
+        sample_id = _insert_recorded_sample(
+            image_hash=saved_hash,
             file_path=rel_path,
             embedding=embedding,
             label=payload.label,
             mode=payload.mode,
             prediction_score=payload.prediction_score,
             reviewed=reviewed_status,
+            provenance=provenance,
             db_path=db.DEFAULT_DB_PATH,
         )
+
+        if advisory is not None and advisory.get("image_hash") != saved_hash:
+            sim_val = float(advisory.get("similarity", 0.0))
+            add_activity_log(
+                "WARNING",
+                "similarity_advisory",
+                f"Visually similar artwork (sim={sim_val:.4f} with #{advisory.get('id')}): recorded as separate Sample #{sample_id}; existing Sample unchanged{set_str}",
+                mode=payload.mode,
+                details={
+                    "id": sample_id,
+                    "similarity": sim_val,
+                    "similar_to": advisory.get("id"),
+                    "similar_to_hash": advisory.get("image_hash"),
+                    "similar_to_label": advisory.get("label"),
+                    "image_hash": saved_hash,
+                    "label": payload.label,
+                    "reviewed": reviewed_status,
+                    "label_provenance": provenance,
+                    "image_set_count": payload.image_set_count,
+                },
+            )
 
         if payload.mode == "manual":
             add_activity_log(
                 "SUCCESS",
                 "sample_recorded",
-                f"Manual rating recorded: Sample #{sample_id} ({image_hash[:8]}...) as {label_str}{set_str}",
+                f"Manual rating recorded: Sample #{sample_id} ({saved_hash[:8]}...) as {label_str}{set_str}",
                 mode="manual",
-                details={"id": sample_id, "label": payload.label, "hash": image_hash[:8], "image_set_count": payload.image_set_count},
+                details={"id": sample_id, "label": payload.label, "hash": saved_hash[:8], "label_provenance": provenance, "image_set_count": payload.image_set_count},
             )
         elif payload.mode == "auto":
             score_str = f"{payload.prediction_score:.2f}" if payload.prediction_score is not None else "N/A"
-            if sampled_for_review:
-                add_activity_log(
-                    "INFO",
-                    "negative_sampled_for_review",
-                    f"Auto decision: Sample #{sample_id} ({image_hash[:8]}...) rated DISLIKE (Score: {score_str}) -> Sampled into Review Queue (5% audit rate){set_str}",
-                    mode="auto",
-                    details={"id": sample_id, "label": payload.label, "score": payload.prediction_score, "sampled_for_review": True},
-                )
-            else:
-                add_activity_log(
-                    "INFO",
-                    "auto_decision",
-                    f"Auto decision: Sample #{sample_id} ({image_hash[:8]}...) rated as {label_str} (Score: {score_str}){set_str}",
-                    mode="auto",
-                    details={"id": sample_id, "label": payload.label, "score": payload.prediction_score, "image_set_count": payload.image_set_count},
-                )
+            add_activity_log(
+                "INFO",
+                "auto_decision",
+                f"Auto decision: Sample #{sample_id} ({saved_hash[:8]}...) rated as {label_str} (Score: {score_str}) -> Review Queue (unreviewed auto_decision){set_str}",
+                mode="auto",
+                details={"id": sample_id, "label": payload.label, "score": payload.prediction_score, "label_provenance": provenance, "image_set_count": payload.image_set_count},
+            )
         else:
             add_activity_log(
                 "SUCCESS",
                 "supervised_confirmed",
-                f"Supervised rating: Sample #{sample_id} ({image_hash[:8]}...) saved as {label_str}{set_str}",
+                f"Supervised rating: Sample #{sample_id} ({saved_hash[:8]}...) saved as {label_str}{set_str}",
                 mode="supervised",
-                details={"id": sample_id, "label": payload.label, "image_set_count": payload.image_set_count},
+                details={"id": sample_id, "label": payload.label, "label_provenance": provenance, "image_set_count": payload.image_set_count},
             )
 
         check_session_drift(db_path=db.DEFAULT_DB_PATH)
@@ -439,9 +554,11 @@ def record_sample(payload: RecordRequest) -> dict[str, Any]:
         return {
             "status": "success",
             "id": sample_id,
-            "image_hash": image_hash,
+            "image_hash": saved_hash,
             "label": payload.label,
             "reviewed": reviewed_status,
+            "label_provenance": provenance,
+            "provenance": provenance,
         }
     except Exception as exc:
         add_activity_log("ERROR", "record_failed", f"Failed to record sample: {str(exc)}", mode=payload.mode)
@@ -480,37 +597,6 @@ def predict_sample(payload: PredictRequest) -> dict[str, Any]:
         ) from exc
 
 
-@app.post("/api/capture")
-def capture_screen_region(payload: CaptureRequest) -> dict[str, Any]:
-    """Capture an OS desktop screen region using mss and return a base64 image."""
-    try:
-        with mss.mss() as sct:
-            monitor = {
-                "left": int(payload.x),
-                "top": int(payload.y),
-                "width": int(payload.width),
-                "height": int(payload.height),
-            }
-            sct_img = sct.grab(monitor)
-            pil_img = Image.frombytes("RGB", sct_img.size, sct_img.bgra, "raw", "BGRX")
-
-            buffer = io.BytesIO()
-            pil_img.save(buffer, format="JPEG", quality=95)
-            b64_str = "data:image/jpeg;base64," + base64.b64encode(buffer.getvalue()).decode("utf-8")
-
-            add_activity_log("INFO", "screen_capture", f"Screen capture fallback: {payload.width}x{payload.height} px at ({payload.x}, {payload.y})")
-            return {
-                "status": "captured",
-                "image_base64": b64_str,
-            }
-    except Exception as exc:
-        add_activity_log("ERROR", "screen_capture_failed", f"Screen capture failed: {str(exc)}")
-        raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail=f"Screen capture failed: {str(exc)}",
-        ) from exc
-
-
 @app.post("/api/train")
 def train_model(payload: TrainRequest = TrainRequest()) -> dict[str, Any]:
     """Train the balanced Logistic Regression model on all labeled samples in the database."""
@@ -524,6 +610,7 @@ def train_model(payload: TrainRequest = TrainRequest()) -> dict[str, Any]:
             threshold=payload.threshold,
             min_recall_floor=payload.min_recall_floor,
             holdout_ratio=payload.holdout_ratio,
+            min_holdout_positives=payload.min_holdout_positives,
             baseline_prompt_text=payload.baseline_prompt_text,
             baseline_image_base64=payload.baseline_image_base64,
             reset_baseline_to_default=payload.reset_baseline_to_default,
@@ -531,22 +618,31 @@ def train_model(payload: TrainRequest = TrainRequest()) -> dict[str, Any]:
 
         if result.get("status") == "trained":
             m = result.get("metrics", {})
-            eval_info = f" ({m.get('evaluation_type', 'cv')}, {m.get('folds', 5)} folds)" if m.get("folds") else ""
-            bp = m.get("best_params", {})
+            tuning = m.get("tuning", {})
+            eff = m.get("effectiveness", {})
+            eval_info = f" ({tuning.get('evaluation_type', m.get('evaluation_type', 'cv'))}, {tuning.get('folds', m.get('folds', 5))} folds)" if (tuning.get("folds") or m.get("folds")) else ""
+            bp = tuning.get("best_params") or m.get("best_params", {})
             params_info = f", C={bp.get('C')}, weight={bp.get('class_weight')}" if bp else ""
+            eligible = m.get("training_eligible", {})
+            eligible_info = f" on {eligible.get('sample_count', result.get('sample_count'))} training-eligible Samples" if eligible else f" on {result.get('sample_count')} samples"
+            temporal = m.get("temporal_holdout") or {}
+            if temporal.get("status") == "available":
+                temporal_info = f"; temporal holdout Recall {temporal.get('recall')}, Precision {temporal.get('precision')} ({temporal.get('positive_count')} Likes / {temporal.get('sample_count')} Samples)"
+            else:
+                temporal_info = "; temporal evaluation unavailable"
             add_activity_log(
                 "SUCCESS",
                 "model_trained",
-                f"Model retrained on {result.get('sample_count')} samples: OOF PR-AUC {m.get('pr_auc')}, Recall {m.get('recall')}, θ={m.get('decision_threshold')}{eval_info}{params_info}",
+                f"Model retrained{eligible_info}: tuning PR-AUC {tuning.get('pr_auc', m.get('pr_auc'))}, Recall {tuning.get('recall', m.get('recall'))}, θ={tuning.get('decision_threshold', m.get('decision_threshold'))}{eval_info}{params_info}{temporal_info}",
                 details=m,
             )
-            if m.get("generalization_warning"):
-                h = m.get("holdout", {})
+            if m.get("warning_active"):
+                reasons = m.get("warning_reasons", [])
                 add_activity_log(
                     "WARNING",
-                    "generalization_warning",
-                    f"Holdout generalization drop: Holdout PR-AUC {h.get('pr_auc')} is significantly below OOF PR-AUC {m.get('pr_auc')}.",
-                    details=h,
+                    "effectiveness_warning",
+                    f"Full auto effectiveness warning active ({eff.get('status', 'unknown')}): {', '.join(reasons) if reasons else 'target unmet'}.",
+                    details={"warning_reasons": reasons, "effectiveness": eff},
                 )
         else:
             add_activity_log("WARNING", "train_insufficient_data", result.get("message", "Insufficient samples to train."))
@@ -701,13 +797,29 @@ def query_samples(
 
 @app.post("/api/review")
 def review_samples(payload: ReviewRequest) -> dict[str, Any]:
-    """Bulk update labels and mark samples as reviewed."""
+    """Bulk review Samples: atomically writes the selected label, reviewed=1, and review_confirmation provenance."""
     try:
-        updates = [item.dict() for item in payload.updates]
+        if _samples_has_provenance_column(db.DEFAULT_DB_PATH):
+            updates = [
+                {
+                    "id": item.id,
+                    "label": item.label,
+                    "reviewed": 1,
+                    "label_provenance": "review_confirmation",
+                }
+                for item in payload.updates
+            ]
+        else:
+            updates = [
+                {"id": item.id, "label": item.label, "reviewed": 1}
+                for item in payload.updates
+            ]
         updated_count = update_sample_reviews(updates, db_path=db.DEFAULT_DB_PATH)
         return {
             "status": "success",
             "updated_count": updated_count,
+            "label_provenance": "review_confirmation",
+            "provenance": "review_confirmation",
         }
     except Exception as exc:
         raise HTTPException(
@@ -773,13 +885,56 @@ def get_metrics() -> dict[str, Any]:
         statistics = get_dataset_statistics(db_path=db.DEFAULT_DB_PATH)
         model_data = load_classifier()
 
+        current_eligible = {
+            "sample_count": statistics.get("training_eligible_count", 0),
+            "positive_count": statistics.get("training_eligible_positive_count", 0),
+            "negative_count": statistics.get("training_eligible_negative_count", 0),
+        }
+
         if model_data is not None:
-            model_info = {
-                "model_loaded": True,
-                "metrics": model_data.get("metrics", {}),
-                "decision_threshold": round(float(model_data.get("decision_threshold", DEFAULT_DECISION_THRESHOLD)), 2),
+            stored_metrics = model_data.get("metrics", {})
+            stored_eligible = stored_metrics.get("training_eligible") or {
+                "sample_count": model_data.get("sample_count", 0),
                 "positive_count": model_data.get("positive_count", 0),
                 "negative_count": model_data.get("negative_count", 0),
+            }
+            effectiveness = stored_metrics.get("effectiveness")
+            if not isinstance(effectiveness, dict):
+                # Legacy artifact predating provenance-aware temporal evaluation
+                # metadata: never present it as a current effectiveness report.
+                effectiveness = {
+                    "status": "temporal_evaluation_unavailable",
+                    "warning_active": True,
+                    "warning_reasons": [
+                        "temporal_evaluation_unavailable",
+                        "legacy_artifact_missing_temporal_evaluation",
+                    ],
+                    "recall_target": EFFECTIVENESS_RECALL_TARGET,
+                    "precision_target": EFFECTIVENESS_PRECISION_TARGET,
+                    "min_holdout_positives": TEMPORAL_MIN_HOLDOUT_LIKES,
+                    "threshold_source": stored_metrics.get("threshold_source", "unknown"),
+                }
+            stale_reason: str | None = None
+            if "temporal_holdout" not in stored_metrics or "eval_boundary" not in stored_metrics:
+                stale_reason = "legacy artifact without temporal evaluation metadata"
+            elif stored_eligible.get("sample_count") != current_eligible["sample_count"]:
+                stale_reason = (
+                    f"Dataset database has {current_eligible['sample_count']} training-eligible Samples "
+                    f"but the model was trained on {stored_eligible.get('sample_count')}"
+                )
+            model_info = {
+                "model_loaded": True,
+                "metrics": stored_metrics,
+                "decision_threshold": round(float(model_data.get("decision_threshold", DEFAULT_DECISION_THRESHOLD)), 2),
+                "threshold_source": stored_metrics.get("threshold_source", model_data.get("threshold_source", "unknown")),
+                "positive_count": model_data.get("positive_count", 0),
+                "negative_count": model_data.get("negative_count", 0),
+                "training_eligible": stored_eligible,
+                "effectiveness": effectiveness,
+                "warning_active": bool(effectiveness.get("warning_active", stored_metrics.get("warning_active", True))),
+                "warning_reasons": list(effectiveness.get("warning_reasons", stored_metrics.get("warning_reasons", []))),
+                "stale_model": stale_reason is not None,
+                "stale_reason": stale_reason,
             }
         else:
             cold_baselines = None
@@ -820,12 +975,29 @@ def get_metrics() -> dict[str, Any]:
                     "baselines": cold_baselines,
                 } if cold_baselines else None,
                 "decision_threshold": round(float(DEFAULT_DECISION_THRESHOLD), 2),
+                "threshold_source": "none",
+                "training_eligible": current_eligible,
+                "effectiveness": {
+                    "status": "temporal_evaluation_unavailable",
+                    "warning_active": True,
+                    "warning_reasons": ["temporal_evaluation_unavailable", "model_not_trained"],
+                    "recall_target": EFFECTIVENESS_RECALL_TARGET,
+                    "precision_target": EFFECTIVENESS_PRECISION_TARGET,
+                    "min_holdout_positives": TEMPORAL_MIN_HOLDOUT_LIKES,
+                    "threshold_source": "none",
+                },
+                "warning_active": True,
+                "warning_reasons": ["temporal_evaluation_unavailable", "model_not_trained"],
+                "stale_model": False,
+                "stale_reason": None,
                 "message": "Model not trained yet.",
             }
 
         return {
             "statistics": statistics,
             "model_status": model_info,
+            "training_eligible": current_eligible,
+            "provenance_counts": statistics.get("provenance_counts", {}),
         }
     except Exception as exc:
         raise HTTPException(
@@ -868,6 +1040,7 @@ def get_embeddings_scatter(
                         "prediction_score": meta["prediction_score"],
                         "mode": meta["mode"],
                         "reviewed": meta["reviewed"],
+                        "label_provenance": meta.get("label_provenance"),
                         "created_at": meta["created_at"],
                         "x": 0.0,
                         "y": 0.0,
@@ -903,6 +1076,7 @@ def get_embeddings_scatter(
                     "prediction_score": meta["prediction_score"],
                     "mode": meta["mode"],
                     "reviewed": meta["reviewed"],
+                    "label_provenance": meta.get("label_provenance"),
                     "created_at": meta["created_at"],
                     "x": round(float(coords[i, 0]), 4),
                     "y": round(float(coords[i, 1]), 4),

@@ -160,24 +160,23 @@ def test_record_near_duplicate_consolidation_api():
                 assert data1["status"] == "success"
                 orig_id = data1["id"]
 
-                # 2. Record a near-duplicate (similarity > 0.98) with an updated label
+                # 2. Record a visually similar but byte-different image: separate
+                # Sample, existing Sample unchanged (similarity is advisory only).
                 mock_extract.return_value = near_dup_vec
                 img_b64_2 = _make_test_image_b64((105, 100, 100))
                 resp2 = client.post("/api/record", json={"image_base64": img_b64_2, "label": 1, "mode": "supervised", "reviewed": 1})
                 assert resp2.status_code == 201
                 data2 = resp2.json()
-                assert data2["status"] == "consolidated"
-                assert data2["id"] == orig_id
-                assert data2["duplicate_of"] == orig_id
-                assert data2["similarity"] >= 0.98
+                assert data2["status"] == "success"
+                assert data2["id"] != orig_id
 
-                # Verify database still has only 1 sample, updated to label=1, reviewed=1
+                # Verify database has 2 samples with both labels preserved.
                 samples_resp = client.get("/api/samples")
                 samples = samples_resp.json()
-                assert len(samples) == 1
-                assert samples[0]["id"] == orig_id
-                assert samples[0]["label"] == 1
-                assert samples[0]["reviewed"] == 1
+                assert len(samples) == 2
+                by_id = {s["id"]: s for s in samples}
+                assert by_id[orig_id]["label"] == 0
+                assert by_id[data2["id"]]["label"] == 1
 
                 # 3. Record an orthogonal image (sim < 0.98)
                 mock_extract.return_value = orthogonal_vec
@@ -188,9 +187,9 @@ def test_record_near_duplicate_consolidation_api():
                 assert data3["status"] == "success"
                 assert data3["id"] != orig_id
 
-                # Now database has exactly 2 samples
+                # Now database has exactly 3 samples
                 samples_after = client.get("/api/samples").json()
-                assert len(samples_after) == 2
+                assert len(samples_after) == 3
 
         finally:
             db_mod.DEFAULT_DB_PATH = orig_db
@@ -236,7 +235,8 @@ def test_near_duplicate_preserves_human_reviewed_label():
                 assert resp1.status_code == 201
                 orig_id = resp1.json()["id"]
 
-                # 2. Scraper encounters near-duplicate in full auto mode with dislike prediction (label=0, reviewed=0)
+                # 2. Scraper encounters visually similar art in full auto mode:
+                # separate unreviewed auto Sample, human Sample unchanged.
                 mock_extract.return_value = near_dup_vec
                 img_b64_2 = _make_test_image_b64((104, 100, 100))
                 resp2 = client.post("/api/record", json={
@@ -248,37 +248,35 @@ def test_near_duplicate_preserves_human_reviewed_label():
                 })
                 assert resp2.status_code == 201
                 data2 = resp2.json()
-                assert data2["status"] == "consolidated"
-                assert data2["id"] == orig_id
-                # Label must remain 1 and reviewed must remain 1
-                assert data2["label"] == 1
-                assert data2["reviewed"] == 1
+                assert data2["status"] == "success"
+                auto_id = data2["id"]
+                assert auto_id != orig_id
+                assert data2["label"] == 0
+                assert data2["reviewed"] == 0
 
-                # Check database row directly
+                # Check both Samples preserved directly
                 samples = client.get("/api/samples").json()
-                assert len(samples) == 1
-                assert samples[0]["id"] == orig_id
-                assert samples[0]["label"] == 1
-                assert samples[0]["reviewed"] == 1
+                assert len(samples) == 2
+                by_id = {s["id"]: s for s in samples}
+                assert by_id[orig_id]["label"] == 1
+                assert by_id[orig_id]["reviewed"] == 1
+                assert by_id[auto_id]["label"] == 0
+                assert by_id[auto_id]["reviewed"] == 0
 
-                # 3. User explicitly overrides in supervised mode (label=0, reviewed=1)
-                resp3 = client.post("/api/record", json={
-                    "image_base64": img_b64_2,
-                    "label": 0,
-                    "mode": "supervised",
-                    "reviewed": 1,
+                # 3. User explicitly corrects the auto Sample via the Review queue.
+                resp3 = client.post("/api/review", json={
+                    "updates": [{"id": auto_id, "label": 0, "reviewed": 1}],
                 })
-                assert resp3.status_code == 201
-                data3 = resp3.json()
-                assert data3["status"] == "consolidated"
-                assert data3["label"] == 0
-                assert data3["reviewed"] == 1
+                assert resp3.status_code == 200
+                assert resp3.json()["updated_count"] == 1
 
-                # Check database row updated after human confirmation
+                # Check auto Sample confirmed after human review; human intact.
                 samples_updated = client.get("/api/samples").json()
-                assert len(samples_updated) == 1
-                assert samples_updated[0]["label"] == 0
-                assert samples_updated[0]["reviewed"] == 1
+                assert len(samples_updated) == 2
+                updated_by_id = {s["id"]: s for s in samples_updated}
+                assert updated_by_id[orig_id]["label"] == 1
+                assert updated_by_id[auto_id]["label"] == 0
+                assert updated_by_id[auto_id]["reviewed"] == 1
 
         finally:
             db_mod.DEFAULT_DB_PATH = orig_db

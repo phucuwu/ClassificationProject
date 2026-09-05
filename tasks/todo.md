@@ -1,26 +1,27 @@
-# Task Checklist: Local Art Taste Classifier
+# Task Checklist: Taste Profile Data Pipeline Integrity
 
-## Phase 1: Environment and Dataset Database Foundation
-- [x] Task 1.1: Create `requirements.txt` and verify Python dependencies.
-- [x] Task 1.2: Implement `backend/database.py` with SQLite WAL mode and sample CRUD operations.
-- [x] **Checkpoint 1:** Verify SQLite schema, WAL mode, and fast NumPy matrix loading from BLOBs.
+## Phase 1: Contract and Dataset Database
 
-## Phase 2: Vision Embedding and Machine Learning Engine
-- [x] Task 2.1: Implement `backend/model.py` with `clip-ViT-L-14` feature extractor.
-- [x] Task 2.2: Implement balanced Logistic Regression training, PR-AUC, $F_2$ evaluation, and threshold inference in `backend/model.py`.
-- [x] **Checkpoint 2:** Verify embedding extraction and model fitting with synthetic validation tests.
+- [ ] Task 1: Define label provenance, training eligibility, and temporal-effectiveness terminology in project documentation.
+- [ ] Task 2: Add a tested idempotent Dataset database migration, legacy-row classification, and database constraints.
+- [ ] Task 3: Restrict the Feature matrix and outlier analysis to reviewed human-confirmed Samples.
+- [ ] **Checkpoint:** Verify provenance migration and training eligibility with focused database/API tests and a copy of the runtime Dataset database.
 
-## Phase 3: Backend Server and API Endpoints
-- [x] Task 3.1: Create FastAPI application in `backend/app.py` with CORS and `/api/record`, `/api/predict`, `/api/capture`.
-- [x] Task 3.2: Implement training and inspection endpoints: `/api/train`, `/api/samples`, `/api/review`, `/api/metrics`.
-- [x] **Checkpoint 3:** Verify all backend API endpoints via automated test requests.
+## Phase 2: Recording, Review, and Capture Integrity
 
-## Phase 4: Developer Web Dashboard
-- [x] Task 4.1: Build dashboard interface in `backend/static/index.html`, `style.css`, and `app.js` with Review Queue thumbnail grid and hotkeys (`1`/`0`).
-- [x] Task 4.2: Build dynamic Decision Threshold slider, confusion matrix view, and one-click Retrain controls.
-- [x] **Checkpoint 4:** Verify dashboard UI at `http://localhost:8000`.
+- [ ] Task 4: Enforce label provenance and Sample validation at the Backend server recording and review boundaries.
+- [ ] Task 5: Replace near-duplicate label consolidation with exact image-hash deduplication and non-destructive similarity warnings.
+- [ ] Task 6: Remove desktop screen capture and make Userscript active-Artwork capture fail closed.
+- [ ] **Checkpoint:** Verify Manual, Supervised, Full auto, review, and capture-failure flows end to end.
 
-## Phase 5: Tampermonkey Userscript
-- [x] Task 5.1: Build `userscript/taste_collector.user.js` with image extraction waterfall (DOM -> Canvas -> `/api/capture`).
-- [x] Task 5.2: Implement Manual mode, Supervised mode HUD overlay, Full auto mode, and arrow key simulation.
-- [x] **Checkpoint 5:** End-to-end integration test on the target art library.
+## Phase 3: Evaluation and Full Auto Warning
+
+- [ ] Task 7: Replace the random holdout with a contiguous temporal holdout and remove in-sample effectiveness fallback.
+- [ ] Task 8: Make temporal holdout metrics and the recall-first effectiveness warning authoritative in the model artifact and API.
+- [ ] Task 9: Show provenance and model-trust state in the Developer dashboard; require acknowledgement before warning-state Full auto activation.
+- [ ] **Checkpoint:** Verify temporal partitioning, metric labels, stale-model status, and Full auto acknowledgement in tests and browser behavior.
+
+## Phase 4: Current Data Recovery
+
+- [ ] Task 10: Back up, migrate, retrain, audit high-leverage errors, and document the current Dataset database results.
+- [ ] **Complete:** Run `python -m pytest`, verify the migrated Dataset database, and confirm documentation matches runtime behavior.

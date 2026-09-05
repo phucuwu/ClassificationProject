@@ -86,18 +86,22 @@ The system consists of two primary components:
 | `id` | `INTEGER PRIMARY KEY AUTOINCREMENT` | Unique identifier |
 | `image_hash` | `TEXT UNIQUE NOT NULL` | SHA-256 hash of image bytes to prevent duplicates |
 | `file_path` | `TEXT NOT NULL` | Relative path to local stored image |
-| `label` | `INTEGER` | `1` (Like), `0` (Dislike), `NULL` (Pending review) |
-| `prediction_score` | `REAL` | Model predicted probability $P(\text{Like})$ from 0.0 to 1.0 |
-| `mode` | `TEXT NOT NULL` | `'manual'`, `'supervised'`, `'auto'` |
-| `reviewed` | `INTEGER DEFAULT 0` | `1` = Confirmed by human, `0` = Pending review |
-| `embedding` | `BLOB NOT NULL` | 768 `float32` vector bytes (3072 bytes) |
+| `label` | `INTEGER CHECK (label IS NULL OR label IN (0, 1))` | `1` (Like), `0` (Dislike), `NULL` (Pending review) |
+| `prediction_score` | `REAL CHECK (prediction_score IS NULL OR (prediction_score >= 0.0 AND prediction_score <= 1.0))` | Model predicted probability $P(\text{Like})$ from 0.0 to 1.0, finite |
+| `mode` | `TEXT NOT NULL CHECK (mode IN ('manual', 'supervised', 'auto'))` | `'manual'`, `'supervised'`, `'auto'` |
+| `reviewed` | `INTEGER NOT NULL DEFAULT 0 CHECK (reviewed IN (0, 1))` | `1` = Confirmed by human, `0` = Pending review |
+| `label_provenance` | `TEXT NOT NULL DEFAULT 'auto_decision' CHECK (label_provenance IN ('manual_rating', 'supervised_confirmation', 'review_confirmation', 'auto_decision'))` | Origin of the label (see glossary) |
+| `embedding` | `BLOB NOT NULL CHECK (length(embedding) = 3072)` | 768 `float32` vector bytes (3072 bytes) |
 | `created_at` | `TIMESTAMP DEFAULT CURRENT_TIMESTAMP` | Ingestion timestamp |
+
+A Sample is training-eligible only when it has a binary label, `reviewed = 1`, and label provenance `manual_rating`, `supervised_confirmation`, or `review_confirmation`. Samples with `auto_decision` provenance never enter the Feature matrix until an explicit human review changes their provenance to `review_confirmation`. Legacy migration classifies reviewed Manual-mode Samples as `manual_rating`, reviewed Supervised-mode Samples as `supervised_confirmation`, and all Auto-mode Samples as unreviewed (`reviewed = 0`) `auto_decision` without inferring historical human confirmation. Schema migration rebuilds the `samples` table transactionally so the `CHECK` constraints apply to both fresh and existing Dataset databases, preserves row IDs, image hashes, paths, labels, embeddings, and timestamps, and is repeatable without changing already migrated rows.
 
 ### Indexes
 * `idx_samples_reviewed` on `samples(reviewed)`
 * `idx_samples_mode` on `samples(mode)`
 * `idx_samples_label` on `samples(label)`
 * `idx_samples_image_hash` on `samples(image_hash)`
+* `idx_samples_provenance` on `samples(label_provenance)`
 
 ---
 
@@ -113,7 +117,8 @@ The system consists of two primary components:
 * Grid search: Evaluates candidate regularization parameters $C \in [0.01, 0.1, 0.5, 1.0, 2.0, 5.0, 10.0]$ across four class weight multipliers (`balanced`, `unweighted`, `balanced_1.5x`, `balanced_2.0x`).
 * Validation: Stratified 5-Fold Cross-Validation on development data generates out-of-fold predictions. When positive samples are fewer than 5, fold count scales down to $\min(5, \text{pos}, \text{neg})$.
 * Ranking metric: Best hyperparameter configuration is selected by out-of-fold PR-AUC, breaking ties with average precision.
-* Final model fitting: Once parameters are selected, the final classifier fits on 100% of labeled samples.
+* Training inputs: `load_training_matrix()` returns only training-eligible Samples by default (binary label, `reviewed = 1`, provenance in `manual_rating`/`supervised_confirmation`/`review_confirmation`). Outlier analysis uses the same training-eligible matrix as model training.
+* Final model fitting: Once parameters are selected, the final classifier fits on 100% of training-eligible samples.
 * Serialization: Model coefficients, intercept scalar, active decision threshold, evaluation metrics, and reference baselines serialize into `data/model.json`. Vectorized inference uses direct NumPy dot products without requiring scikit-learn unpickling.
 
 ### Decision threshold calibration
@@ -123,7 +128,8 @@ The system consists of two primary components:
 * Explicit manual override: Allows setting the active threshold directly via `POST /api/threshold` or `POST /api/train`.
 
 ### Generalization verification
-* Holdout partition: Reserves the holdout fraction (default 15%) to verify out-of-fold generalization.
+* Temporal holdout: Reserves a contiguous suffix of training-eligible Samples ordered by creation order as the holdout; the earlier prefix is the development partition. Neither partition is shuffled across time. Cross-validation metrics are development/tuning metrics only; the temporal holdout is the only model-effectiveness report and the source of Full auto warning state.
+* Effectiveness warning: The warning is active when temporal evaluation is unavailable (the holdout cannot retain both classes and the configured minimum Positive-class count, so no random split is substituted) or when the recall-first target is unmet (holdout Positive-class count below 30, recall below `0.80`, or precision below `0.60`).
 * Divergence alert: If holdout PR-AUC drops by more than 0.25 below out-of-fold PR-AUC, the system records a generalization warning in model metadata and logs.
 
 ### Reference baselines
@@ -165,7 +171,7 @@ Located in `tasks/benchmark_backbones.py` and exposed through `POST /api/benchma
 1. The userscript extracts the primary image and requests a prediction from `POST /api/predict`.
 2. The userscript evaluates the score against the active decision threshold.
 3. The userscript simulates the appropriate arrow key action immediately.
-4. The userscript posts the record to `POST /api/record` with `mode = 'auto'`. All positive decisions enter the review queue (`reviewed = 0`). Dislikes are sampled at a configurable audit rate (default 5% set to `reviewed = 0`, remainder marked `reviewed = 1`).
+4. The userscript posts the record to `POST /api/record` with `mode = 'auto'`. Every Full auto Sample persists as `auto_decision` provenance with `reviewed = 0` and remains unreviewed until an explicit human review confirms or corrects it to `review_confirmation`. No automated Dislike is marked reviewed at record time.
 5. The user reviews and corrects automated decisions in bulk via the developer dashboard review queue.
 
 ---
@@ -174,10 +180,10 @@ Located in `tasks/benchmark_backbones.py` and exposed through `POST /api/benchma
 
 The backend server serves a single-page dashboard at `http://localhost:8000`:
 
-* **Review queue tab:** Card grid showing automated decisions pending review (`reviewed = 0`). Users click cards or press `1`/`0` to toggle labels, and click "Mark All Visible as Reviewed" to confirm in bulk.
+* **Review queue tab:** Card grid showing automated decisions pending review (`reviewed = 0`, `auto_decision` provenance) with label provenance displayed. Users click cards or press `1`/`0` to toggle labels, and click "Mark All Visible as Reviewed" to confirm in bulk (writing `reviewed = 1` with `review_confirmation` provenance).
 * **Samples tab (Dataset inspector):** Filterable grid of all stored samples. Supports filtering by mode, label, and outlier quality status (inconsistent likes or dislikes). Includes select all, deselect, and batch deletion controls.
 * **Embedding space tab:** Hardware-accelerated 2D canvas visualization of the 768-dimensional vision embedding space using PCA or t-SNE projection. Includes cursor-centered zoom, pan, point color modes (by label or prediction score), thumbnail hover previews from `/images/{image_hash}.jpg`, and a slide-out sample inspection drawer.
-* **Model & metrics tab:** Visualizes out-of-fold Precision-Recall curves, a dynamic threshold tuning slider with quick preset chips, a confusion matrix table, zero-shot reference baseline controls, retrain trigger, and vision backbone benchmark controls.
+* **Model & metrics tab:** Visualizes out-of-fold Precision-Recall curves as development/tuning metrics, a dynamic threshold tuning slider with quick preset chips, a confusion matrix table, temporal-holdout effectiveness metrics with warning reasons kept separate from tuning metrics, training-eligible counts, zero-shot reference baseline controls, retrain trigger, and vision backbone benchmark controls.
 * **Console tab:** Real-time stream of system activity logs, manual ratings, predictions, near-duplicate consolidations, session drift alerts, and training events.
 
 ---

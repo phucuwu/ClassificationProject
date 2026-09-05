@@ -76,7 +76,8 @@ def test_model_training_and_inference():
     with tempfile.TemporaryDirectory() as tmpdir:
         model_path = Path(tmpdir) / "test_model.pkl"
 
-        # Generate synthetic imbalanced dataset: 90 dislikes (0), 10 likes (1)
+        # Generate synthetic imbalanced dataset: 90 dislikes (0), 10 likes (1),
+        # interleaved in creation order so the development prefix holds both classes.
         np.random.seed(42)
         n_dislikes = 90
         n_likes = 10
@@ -90,11 +91,24 @@ def test_model_training_and_inference():
         X_neg = X_neg / np.linalg.norm(X_neg, axis=1, keepdims=True)
         X_pos = X_pos / np.linalg.norm(X_pos, axis=1, keepdims=True)
 
-        X = np.vstack([X_neg, X_pos]).astype(np.float32)
-        y = np.array([0] * n_dislikes + [1] * n_likes, dtype=np.int32)
+        # Interleave: every 10th creation slot is a Like (deterministic order)
+        X = np.empty((n_total, EMBEDDING_DIM), dtype=np.float32)
+        y = np.zeros(n_total, dtype=np.int32)
+        sample_ids = list(range(1000, 1000 + n_total))
+        neg_idx = 0
+        pos_idx = 0
+        for i in range(n_total):
+            if i % 10 == 9:
+                X[i] = X_pos[pos_idx]
+                y[i] = 1
+                pos_idx += 1
+            else:
+                X[i] = X_neg[neg_idx]
+                y[i] = 0
+                neg_idx += 1
 
         # Train classifier
-        train_result = train_taste_classifier(X, y, target_recall=0.90, model_path=model_path)
+        train_result = train_taste_classifier(X, y, sample_ids=sample_ids, target_recall=0.90, model_path=model_path)
         assert train_result["status"] == "trained"
         assert train_result["sample_count"] == n_total
         assert train_result["positive_count"] == n_likes
@@ -124,7 +138,12 @@ def test_model_training_and_inference():
 
 
 def test_stratified_cv_and_oof_metrics():
-    """Verify Stratified 5-Fold CV generates honest out-of-fold metrics and holdout evaluation."""
+    """Verify temporal split: newest suffix is the holdout, earlier prefix tunes.
+
+    With only 15 Likes in a 100-Sample collection the newest 15-Sample suffix
+    cannot meet the 30-Like minimum, so temporal evaluation is unavailable and
+    no random split is substituted. Development tuning still runs stratified CV.
+    """
     with tempfile.TemporaryDirectory() as tmpdir:
         model_path = Path(tmpdir) / "test_cv_model.pkl"
         np.random.seed(42)
@@ -134,7 +153,7 @@ def test_stratified_cv_and_oof_metrics():
         X_neg /= np.linalg.norm(X_neg, axis=1, keepdims=True)
         X_pos /= np.linalg.norm(X_pos, axis=1, keepdims=True)
 
-        # Interleave so both 85% dev set and 15% holdout set contain likes
+        # Interleave so creation order carries both classes throughout
         X = np.empty((100, EMBEDDING_DIM), dtype=np.float32)
         y = np.zeros(100, dtype=np.int32)
         pos_indices = {5, 12, 19, 25, 33, 41, 48, 55, 62, 70, 78, 83, 89, 94, 98}
@@ -149,8 +168,9 @@ def test_stratified_cv_and_oof_metrics():
                 X[i] = X_neg[neg_idx]
                 y[i] = 0
                 neg_idx += 1
+        sample_ids = list(range(500, 600))
 
-        result = train_taste_classifier(X, y, holdout_ratio=0.15, model_path=model_path)
+        result = train_taste_classifier(X, y, sample_ids=sample_ids, holdout_ratio=0.15, model_path=model_path)
         assert result["status"] == "trained"
         m = result["metrics"]
         assert m["evaluation_type"] == "stratified_cv"
@@ -162,22 +182,34 @@ def test_stratified_cv_and_oof_metrics():
         assert "f2_score" in m
         assert "confusion_matrix" in m
 
-        # Holdout was evaluated
-        assert m["holdout"] is not None
-        h = m["holdout"]
-        assert h["sample_count"] == 15
-        assert h["positive_count"] >= 1
-        assert "pr_auc" in h
-        assert "average_precision" in h
-        assert "recall" in h
-        assert "f2_score" in h
+        # Temporal holdout is the newest 15-Sample suffix: exact IDs, no leakage
+        boundary = m["eval_boundary"]
+        assert boundary["dev_size"] == 85
+        assert boundary["holdout_size"] == 15
+        assert boundary["dev_sample_ids"] == list(range(500, 585))
+        assert boundary["holdout_sample_ids"] == list(range(585, 600))
+        assert max(boundary["dev_sample_ids"]) < min(boundary["holdout_sample_ids"])
 
-        # Model artifact contains cached out-of-fold probabilities
+        # Holdout cannot meet the 30-Like minimum: unavailable, never random
+        assert m["temporal_holdout"]["status"] == "temporal_evaluation_unavailable"
+        assert m["holdout"] is None
+        assert "temporal_evaluation_unavailable" in m["warning_reasons"]
+        assert "holdout_likes_below_minimum" in m["warning_reasons"]
+        assert m["warning_active"] is True
+        assert m["effectiveness"]["status"] == "temporal_evaluation_unavailable"
+
+        # Tuning section mirrors the development-partition metrics
+        assert m["tuning"]["evaluation_type"] == "stratified_cv"
+        assert m["tuning"]["dev_sample_count"] == 85
+        assert m["tuning"]["dev_sample_ids"] == list(range(500, 585))
+
+        # Model artifact contains cached development-partition probabilities
         loaded = load_classifier(model_path)
         assert "oof_probabilities" in loaded
         assert "y_oof" in loaded
         assert len(loaded["oof_probabilities"]) == 85
         assert len(loaded["y_oof"]) == 85
+        assert loaded["holdout_sample_ids"] == list(range(585, 600))
 
 
 def test_dynamic_fold_scaling():
@@ -196,13 +228,20 @@ def test_dynamic_fold_scaling():
         assert res["status"] == "trained"
         assert res["metrics"]["evaluation_type"] == "stratified_cv"
         assert res["metrics"]["folds"] == 3  # min(5, 3) = 3
+        # holdout_ratio=0.0 disables the temporal holdout: unavailable + warning
+        assert res["metrics"]["temporal_holdout"]["status"] == "temporal_evaluation_unavailable"
+        assert res["metrics"]["warning_active"] is True
 
-        # Single positive sample: fallback to in-sample evaluation
+        # Single positive sample: limited tuning data, still trains, but temporal
+        # evaluation is unavailable and no in-sample effectiveness is reported.
         X_single = np.vstack([X_neg[:10], X_pos[:1]]).astype(np.float32)
         y_single = np.array([0] * 10 + [1] * 1, dtype=np.int32)
         res_single = train_taste_classifier(X_single, y_single, holdout_ratio=0.0, model_path=model_path)
         assert res_single["status"] == "trained"
-        assert res_single["metrics"]["evaluation_type"] == "in_sample_fallback"
+        assert res_single["metrics"]["evaluation_type"] == "limited_tuning_data"
+        assert "in_sample" not in res_single["metrics"]["evaluation_type"]
+        assert res_single["metrics"]["temporal_holdout"]["status"] == "temporal_evaluation_unavailable"
+        assert res_single["metrics"]["warning_active"] is True
 
 
 def test_hybrid_threshold_calibration():
@@ -223,33 +262,48 @@ def test_hybrid_threshold_calibration():
         assert 0.05 <= m["decision_threshold"] <= 0.95
 
 
-def test_holdout_generalization_warning():
-    """Verify generalization warning is triggered when holdout performance drops drastically."""
+def test_temporal_holdout_recall_below_target():
+    """Verify the effectiveness warning fires when holdout recall is below 0.80.
+
+    The development prefix is cleanly separable but the newest holdout Likes
+    are shifted into Dislike territory, so the dev-calibrated threshold misses
+    them. The temporal holdout is valid (both classes + minimum met via an
+    explicit small minimum), yet recall misses the target.
+    """
     with tempfile.TemporaryDirectory() as tmpdir:
         model_path = Path(tmpdir) / "test_warning_model.pkl"
-        np.random.seed(42)
-        from sklearn.model_selection import train_test_split as _tts
+        np.random.seed(7)
 
-        n_neg = 60
-        n_pos = 12
-        y = np.array([0] * n_neg + [1] * n_pos, dtype=np.int32)
-        idx = np.arange(len(y))
-        _, h_idx = _tts(idx, test_size=0.166, stratify=y, random_state=42)
+        # Development prefix: 50 Dislikes + 10 Likes, well separated
+        X_dev_neg = np.random.randn(50, EMBEDDING_DIM).astype(np.float32)
+        X_dev_pos = np.random.randn(10, EMBEDDING_DIM).astype(np.float32) + 2.0
+        # Temporal suffix: 8 Dislikes (normal) + 4 Likes shifted into Dislike territory
+        X_hold_neg = np.random.randn(8, EMBEDDING_DIM).astype(np.float32)
+        X_hold_pos = np.random.randn(4, EMBEDDING_DIM).astype(np.float32) - 2.0
 
-        X = np.random.randn(len(y), EMBEDDING_DIM).astype(np.float32)
-        X[y == 1] += 2.0
+        X = np.vstack([X_dev_neg, X_dev_pos, X_hold_neg, X_hold_pos]).astype(np.float32)
+        X /= np.linalg.norm(X, axis=1, keepdims=True)
+        y = np.array([0] * 50 + [1] * 10 + [0] * 8 + [1] * 4, dtype=np.int32)
+        sample_ids = list(range(1, 73))
 
-        # Invert holdout samples so development set is cleanly separable but holdout mispredicts
-        for i in h_idx:
-            if y[i] == 1:
-                X[i] -= 4.0
-            else:
-                X[i] += 4.0
-
-        res = train_taste_classifier(X, y, holdout_ratio=0.166, model_path=model_path)
+        # 12 newest Samples form the holdout: round(72 * 0.1667) = 12
+        res = train_taste_classifier(
+            X, y, sample_ids=sample_ids, holdout_ratio=0.1667, min_holdout_positives=4, model_path=model_path
+        )
         assert res["status"] == "trained"
-        assert res["metrics"]["generalization_warning"] is True
-        assert res["metrics"]["holdout"]["generalization_warning"] is True
+        m = res["metrics"]
+        assert m["temporal_holdout"]["status"] == "available"
+        assert m["temporal_holdout"]["sample_count"] == 12
+        assert m["temporal_holdout"]["positive_count"] == 4
+        assert m["holdout"] is not None
+        assert m["effectiveness"]["status"] == "below_target"
+        assert m["warning_active"] is True
+        assert "recall_below_target" in m["warning_reasons"]
+        # Legacy alias mirrors the recall-first warning
+        assert m["generalization_warning"] is True
+        # Exact temporal boundary: holdout is the newest suffix
+        assert m["eval_boundary"]["holdout_sample_ids"] == list(range(61, 73))
+        assert max(m["eval_boundary"]["dev_sample_ids"]) < min(m["eval_boundary"]["holdout_sample_ids"])
 
 
 def test_threshold_update_with_cached_oof():
@@ -398,6 +452,174 @@ def test_baseline_customization_and_persistence():
         assert b4["reference_source"] == DEFAULT_ZERO_SHOT_PROMPT
 
 
+def test_temporal_split_orders_by_creation_ids():
+    """Verify creation ordering: shuffled input is re-sorted by Sample id."""
+    with tempfile.TemporaryDirectory() as tmpdir:
+        model_path = Path(tmpdir) / "test_order_model.pkl"
+        np.random.seed(11)
+        n = 40
+        X = np.random.randn(n, EMBEDDING_DIM).astype(np.float32)
+        X /= np.linalg.norm(X, axis=1, keepdims=True)
+        y = np.zeros(n, dtype=np.int32)
+        y[::5] = 1  # every 5th creation slot is a Like in input order
+        ids = list(range(2000, 2000 + n))
+
+        # Shuffle input order deterministically (labels travel with rows)
+        perm = np.random.RandomState(11).permutation(n)
+        Xs, ys = X[perm], y[perm]
+        ids_shuffled = [ids[i] for i in perm]
+
+        res = train_taste_classifier(Xs, ys, sample_ids=ids_shuffled, holdout_ratio=0.2, model_path=model_path)
+        assert res["status"] == "trained"
+        boundary = res["metrics"]["eval_boundary"]
+        # Newest suffix by id, regardless of input order
+        assert boundary["holdout_sample_ids"] == list(range(2032, 2040))
+        assert boundary["dev_sample_ids"] == list(range(2000, 2032))
+        assert boundary["dev_max_id"] == 2031
+        assert boundary["holdout_min_id"] == 2032
+
+
+def test_temporal_never_uses_random_split():
+    """Verify no random splitter remains in the training path."""
+    import inspect
+
+    import backend.model as model_mod
+
+    source = inspect.getsource(model_mod.train_taste_classifier)
+    assert "train_test_split" not in source
+    assert "in_sample_fallback" not in source
+
+    # Deterministic: repeated runs record identical boundaries
+    with tempfile.TemporaryDirectory() as tmpdir:
+        np.random.seed(13)
+        n = 60
+        X = np.random.randn(n, EMBEDDING_DIM).astype(np.float32)
+        X /= np.linalg.norm(X, axis=1, keepdims=True)
+        y = np.zeros(n, dtype=np.int32)
+        y[::4] = 1
+        ids = list(range(300, 360))
+        r1 = train_taste_classifier(X, y, sample_ids=ids, holdout_ratio=0.2, model_path=Path(tmpdir) / "a.json")
+        r2 = train_taste_classifier(X, y, sample_ids=ids, holdout_ratio=0.2, model_path=Path(tmpdir) / "b.json")
+        assert r1["metrics"]["eval_boundary"] == r2["metrics"]["eval_boundary"]
+
+
+def test_temporal_unavailable_when_holdout_missing_class():
+    """Verify unavailable status when the newest suffix holds a single class."""
+    with tempfile.TemporaryDirectory() as tmpdir:
+        model_path = Path(tmpdir) / "test_single_class_holdout.pkl"
+        np.random.seed(17)
+        # 30 mixed Samples followed by 10 newest Dislikes
+        X_mixed = np.random.randn(30, EMBEDDING_DIM).astype(np.float32)
+        X_new = np.random.randn(10, EMBEDDING_DIM).astype(np.float32)
+        X = np.vstack([X_mixed, X_new]).astype(np.float32)
+        X /= np.linalg.norm(X, axis=1, keepdims=True)
+        y = np.zeros(40, dtype=np.int32)
+        y[2::6] = 1
+        y[30:] = 0
+        assert int(np.sum(y[:30] == 1)) >= 2
+
+        res = train_taste_classifier(X, y, sample_ids=list(range(40)), holdout_ratio=0.25, model_path=model_path)
+        assert res["status"] == "trained"
+        m = res["metrics"]
+        assert m["temporal_holdout"]["status"] == "temporal_evaluation_unavailable"
+        assert "holdout_missing_positive_class" in m["warning_reasons"]
+        assert m["warning_active"] is True
+
+
+def test_insufficient_data_rejects_without_insample_metrics():
+    """Verify rejection for model use when the dev prefix lacks both classes."""
+    with tempfile.TemporaryDirectory() as tmpdir:
+        model_path = Path(tmpdir) / "test_reject.pkl"
+        np.random.seed(19)
+        # All Likes are the newest Samples: the development prefix has none
+        X = np.random.randn(20, EMBEDDING_DIM).astype(np.float32)
+        X /= np.linalg.norm(X, axis=1, keepdims=True)
+        y = np.array([0] * 14 + [1] * 6, dtype=np.int32)
+
+        res = train_taste_classifier(X, y, sample_ids=list(range(20)), holdout_ratio=0.3, model_path=model_path)
+        assert res["status"] == "insufficient_data"
+        assert "metrics" not in res  # no in-sample effectiveness signal
+
+
+def test_temporal_holdout_precision_below_target():
+    """Verify the warning fires when holdout precision is below 0.60 but recall holds."""
+    with tempfile.TemporaryDirectory() as tmpdir:
+        model_path = Path(tmpdir) / "test_prec_model.pkl"
+        np.random.seed(23)
+
+        # Development prefix: 50 Dislikes + 20 Likes, well separated
+        X_dev_neg = np.random.randn(50, EMBEDDING_DIM).astype(np.float32)
+        X_dev_pos = np.random.randn(20, EMBEDDING_DIM).astype(np.float32) + 2.0
+        # Newest suffix: 6 Likes (caught) + 10 Dislikes shifted into Like territory
+        X_hold_pos = np.random.randn(6, EMBEDDING_DIM).astype(np.float32) + 2.0
+        X_hold_neg = np.random.randn(10, EMBEDDING_DIM).astype(np.float32) + 2.0
+
+        X = np.vstack([X_dev_neg, X_dev_pos, X_hold_pos, X_hold_neg]).astype(np.float32)
+        X /= np.linalg.norm(X, axis=1, keepdims=True)
+        y = np.array([0] * 50 + [1] * 20 + [1] * 6 + [0] * 10, dtype=np.int32)
+        sample_ids = list(range(1, 87))
+
+        res = train_taste_classifier(
+            X, y, sample_ids=sample_ids, holdout_ratio=0.186, min_holdout_positives=6, model_path=model_path
+        )
+        assert res["status"] == "trained"
+        m = res["metrics"]
+        assert m["temporal_holdout"]["status"] == "available"
+        assert m["temporal_holdout"]["sample_count"] == 16
+        assert m["temporal_holdout"]["positive_count"] == 6
+        assert m["effectiveness"]["status"] == "below_target"
+        assert "precision_below_target" in m["warning_reasons"]
+        assert "recall_below_target" not in m["warning_reasons"]
+        assert m["warning_active"] is True
+
+
+def test_temporal_meets_target():
+    """Verify a well-generalizing model with 30 holdout Likes meets the target."""
+    with tempfile.TemporaryDirectory() as tmpdir:
+        model_path = Path(tmpdir) / "test_meets_target.json"
+        np.random.seed(29)
+        n_total, n_likes = 400, 120
+
+        X_neg = np.random.randn(n_total - n_likes, EMBEDDING_DIM).astype(np.float32)
+        X_pos = np.random.randn(n_likes, EMBEDDING_DIM).astype(np.float32) + 2.5
+        X = np.empty((n_total, EMBEDDING_DIM), dtype=np.float32)
+        y = np.zeros(n_total, dtype=np.int32)
+        neg_idx = 0
+        pos_idx = 0
+        for i in range(n_total):
+            if i % 10 in (7, 8, 9):  # 30% Likes, evenly spread through creation order
+                X[i] = X_pos[pos_idx]
+                y[i] = 1
+                pos_idx += 1
+            else:
+                X[i] = X_neg[neg_idx]
+                y[i] = 0
+                neg_idx += 1
+        X /= np.linalg.norm(X, axis=1, keepdims=True)
+        sample_ids = list(range(10000, 10000 + n_total))
+
+        res = train_taste_classifier(X, y, sample_ids=sample_ids, holdout_ratio=0.25, model_path=model_path)
+        assert res["status"] == "trained"
+        m = res["metrics"]
+        # Newest 100 Samples hold exactly 30 Likes
+        assert m["temporal_holdout"]["status"] == "available"
+        assert m["temporal_holdout"]["sample_count"] == 100
+        assert m["temporal_holdout"]["positive_count"] == 30
+        assert m["temporal_holdout"]["recall"] >= 0.80
+        assert m["temporal_holdout"]["precision"] >= 0.60
+        assert m["effectiveness"]["status"] == "meets_target"
+        assert m["warning_active"] is False
+        assert m["warning_reasons"] == []
+        assert m["threshold_source"] == "calibrated"
+
+        # Final classifier fit on all eligible Samples after eval was recorded
+        loaded = load_classifier(model_path)
+        assert loaded["sample_count"] == n_total
+        assert loaded["training_eligible"]["sample_count"] == n_total
+        assert loaded["eval_boundary"]["holdout_sample_ids"] == list(range(10300, 10400))
+        assert loaded["threshold_source"] == "calibrated"
+
+
 if __name__ == "__main__":
     print("Testing cold start and edge cases...")
     test_cold_start_and_insufficient_data()
@@ -407,10 +629,20 @@ if __name__ == "__main__":
     test_stratified_cv_and_oof_metrics()
     print("Testing dynamic fold scaling...")
     test_dynamic_fold_scaling()
-    print("Testing hybrid threshold calibration...")
-    test_hybrid_threshold_calibration()
-    print("Testing holdout generalization warning...")
-    test_holdout_generalization_warning()
+    print("Testing temporal holdout recall below target...")
+    test_temporal_holdout_recall_below_target()
+    print("Testing temporal ordering by creation IDs...")
+    test_temporal_split_orders_by_creation_ids()
+    print("Testing no random split in training path...")
+    test_temporal_never_uses_random_split()
+    print("Testing unavailable holdout for single-class suffix...")
+    test_temporal_unavailable_when_holdout_missing_class()
+    print("Testing insufficient-data rejection...")
+    test_insufficient_data_rejects_without_insample_metrics()
+    print("Testing precision below target...")
+    test_temporal_holdout_precision_below_target()
+    print("Testing meets-target case...")
+    test_temporal_meets_target()
     print("Testing threshold updates with cached out-of-fold predictions...")
     test_threshold_update_with_cached_oof()
     print("Testing hyperparameter grid search...")

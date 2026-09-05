@@ -45,22 +45,17 @@ def test_complete_system_workflow():
             client = TestClient(app)
 
             # --- Step 1: Manual Mode (Data Gathering) ---
-            # Ingest 10 dislikes and 2 likes
-            for i in range(10):
-                img_b64 = _generate_test_image(seed=i + 1, base_color=(50 + i * 10, 50, 50))
+            # Ingest interleaved 10 dislikes and 2 likes so the temporal
+            # development prefix retains both classes (contiguous holdout).
+            sequence = [0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 1]
+            for i, label in enumerate(sequence):
+                if label == 0:
+                    img_b64 = _generate_test_image(seed=i + 1, base_color=(50 + i * 10, 50, 50))
+                else:
+                    img_b64 = _generate_test_image(seed=100 + i, base_color=(200, 180, 220))
                 resp = client.post("/api/record", json={
                     "image_base64": img_b64,
-                    "label": 0,
-                    "mode": "manual",
-                    "reviewed": 1,
-                })
-                assert resp.status_code == 201
-
-            for i in range(2):
-                img_b64 = _generate_test_image(seed=100 + i, base_color=(200, 180 + i * 20, 220))
-                resp = client.post("/api/record", json={
-                    "image_base64": img_b64,
-                    "label": 1,
+                    "label": label,
                     "mode": "manual",
                     "reviewed": 1,
                 })
@@ -72,12 +67,16 @@ def test_complete_system_workflow():
             assert stats_initial["negative_count"] == 10
 
             # --- Step 2: Train Model ---
+            # Tiny synthetic set cannot meet the 30-Like temporal holdout, so
+            # effectiveness is unavailable with an active Full auto warning.
             train_resp = client.post("/api/train", json={"target_recall": 0.90})
             assert train_resp.status_code == 200
             train_data = train_resp.json()
             assert train_data["status"] == "trained"
             assert "metrics" in train_data
             assert "decision_threshold" in train_data["metrics"]
+            effectiveness = train_data["metrics"].get("effectiveness", {})
+            assert effectiveness.get("warning_active") is True
 
             # --- Step 3: Supervised Mode (Prediction + Confirmation) ---
             super_img = _generate_test_image(seed=200, base_color=(210, 190, 230))
@@ -119,7 +118,8 @@ def test_complete_system_workflow():
             assert len(queue) == 1
             assert queue[0]["id"] == auto_sample_id
 
-            # Test negative_sample_rate=0.0 marks negative decision as reviewed=1
+            # Every Full auto Sample stays unreviewed until human review,
+            # even with negative_sample_rate=0.0 (audit sampling removed).
             rec_auto_unsampled = client.post("/api/record", json={
                 "image_base64": _generate_test_image(seed=400, base_color=(45, 65, 85)),
                 "label": 0,
@@ -128,7 +128,7 @@ def test_complete_system_workflow():
                 "negative_sample_rate": 0.0,
             })
             assert rec_auto_unsampled.status_code == 201
-            assert rec_auto_unsampled.json()["reviewed"] == 1
+            assert rec_auto_unsampled.json()["reviewed"] == 0
 
             # --- Step 5: Dashboard Review Action ---
             rev_resp = client.post("/api/review", json={
@@ -139,9 +139,9 @@ def test_complete_system_workflow():
             assert rev_resp.status_code == 200
             assert rev_resp.json()["updated_count"] == 1
 
-            # Verify queue is now empty
+            # Verify one unreviewed auto Sample remains (the second auto record)
             queue_after = client.get("/api/samples", params={"mode": "auto", "reviewed": 0}).json()
-            assert len(queue_after) == 0
+            assert len(queue_after) == 1
 
             # --- Step 6: Session Drift Detection Test ---
             # Ingest additional distinct positive samples to push window over min_window (20) with high positive skew (> 10%)
@@ -175,7 +175,7 @@ def test_complete_system_workflow():
             # --- Step 7: Final Verification ---
             final_metrics = client.get("/api/metrics").json()
             assert final_metrics["statistics"]["total_samples"] == 25
-            assert final_metrics["statistics"]["pending_auto_review_count"] == 0
+            assert final_metrics["statistics"]["pending_auto_review_count"] == 1
             assert final_metrics["model_status"]["model_loaded"] is True
 
         finally:

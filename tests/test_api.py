@@ -3,7 +3,9 @@
 import base64
 import io
 import tempfile
+from contextlib import contextmanager
 from pathlib import Path
+from unittest.mock import patch
 
 import numpy as np
 from fastapi.testclient import TestClient
@@ -180,6 +182,308 @@ def test_api_endpoints_end_to_end():
             db_mod.DEFAULT_DB_PATH = orig_db
             db_mod.IMAGES_DIR = orig_images
             model_mod.MODEL_PATH = orig_model
+
+
+# ---------------------------------------------------------------------------
+# Phase 2: provenance-aware recording/review, exact-hash dedup, capture removal
+# ---------------------------------------------------------------------------
+
+REPO_ROOT = Path(__file__).resolve().parent.parent
+
+
+@contextmanager
+def _isolated_backend(tmpdir: str | Path):
+    """Patch backend paths to an isolated temp dir and yield a TestClient."""
+    tmp_path = Path(tmpdir)
+    test_db_path = tmp_path / "test_dataset.db"
+    test_img_dir = tmp_path / "images"
+    test_model_path = tmp_path / "test_model.pkl"
+
+    orig_db = db_mod.DEFAULT_DB_PATH
+    orig_images = db_mod.IMAGES_DIR
+    orig_model = model_mod.MODEL_PATH
+
+    db_mod.DEFAULT_DB_PATH = test_db_path
+    db_mod.IMAGES_DIR = test_img_dir
+    model_mod.MODEL_PATH = test_model_path
+    try:
+        db_mod.init_db(test_db_path)
+        yield TestClient(app)
+    finally:
+        db_mod.DEFAULT_DB_PATH = orig_db
+        db_mod.IMAGES_DIR = orig_images
+        model_mod.MODEL_PATH = orig_model
+
+
+def _samples_by_id(client: TestClient) -> dict[int, dict]:
+    resp = client.get("/api/samples", params={"limit": 200})
+    assert resp.status_code == 200
+    return {s["id"]: s for s in resp.json()}
+
+
+def test_phase2_record_rejects_invalid_payloads():
+    """Constrained /api/record and /api/review types reject bad labels, modes, scores, and review flags."""
+    with tempfile.TemporaryDirectory() as tmpdir:
+        with _isolated_backend(tmpdir) as client:
+            img = _create_test_image_b64()
+            bad_record_payloads = [
+                {"image_base64": img, "label": 2, "mode": "manual"},
+                {"image_base64": img, "label": "like", "mode": "manual"},
+                {"image_base64": img, "label": 1, "mode": "turbo"},
+                {"image_base64": img, "label": 1, "mode": "manual", "prediction_score": 1.5},
+                {"image_base64": img, "label": 1, "mode": "manual", "prediction_score": -0.1},
+                {"image_base64": img, "label": 1, "mode": "manual", "reviewed": 2},
+                {"label": 1, "mode": "manual"},
+                {"image_base64": "", "label": 1, "mode": "manual"},
+            ]
+            for payload in bad_record_payloads:
+                resp = client.post("/api/record", json=payload)
+                assert resp.status_code in (400, 422), payload
+
+            bad_review = client.post(
+                "/api/review",
+                json={"updates": [{"id": 1, "label": 5, "reviewed": 1}]},
+            )
+            assert bad_review.status_code in (400, 422)
+
+
+def test_phase2_record_forces_provenance_and_review_state():
+    """The server derives provenance/review state from mode, ignoring caller hints."""
+    with tempfile.TemporaryDirectory() as tmpdir:
+        with _isolated_backend(tmpdir) as client:
+            manual = client.post(
+                "/api/record",
+                json={
+                    "image_base64": _create_test_image_b64(color=(200, 10, 10)),
+                    "label": 1,
+                    "mode": "manual",
+                    "reviewed": 0,
+                },
+            )
+            assert manual.status_code == 201
+            assert manual.json()["reviewed"] == 1
+            assert manual.json()["label_provenance"] == "manual_rating"
+
+            supervised = client.post(
+                "/api/record",
+                json={
+                    "image_base64": _create_test_image_b64(color=(10, 200, 10)),
+                    "label": 0,
+                    "mode": "supervised",
+                    "prediction_score": 0.2,
+                    "reviewed": 0,
+                },
+            )
+            assert supervised.status_code == 201
+            assert supervised.json()["reviewed"] == 1
+            assert supervised.json()["label_provenance"] == "supervised_confirmation"
+
+            auto = client.post(
+                "/api/record",
+                json={
+                    "image_base64": _create_test_image_b64(color=(10, 10, 200)),
+                    "label": 1,
+                    "mode": "auto",
+                    "prediction_score": 0.9,
+                    "reviewed": 1,
+                },
+            )
+            assert auto.status_code == 201
+            assert auto.json()["reviewed"] == 0
+            assert auto.json()["label_provenance"] == "auto_decision"
+
+            rows = _samples_by_id(client)
+            assert rows[manual.json()["id"]]["label_provenance"] == "manual_rating"
+            assert rows[manual.json()["id"]]["reviewed"] == 1
+            assert rows[supervised.json()["id"]]["label_provenance"] == "supervised_confirmation"
+            assert rows[supervised.json()["id"]]["reviewed"] == 1
+            assert rows[auto.json()["id"]]["label_provenance"] == "auto_decision"
+            assert rows[auto.json()["id"]]["reviewed"] == 0
+
+
+def test_phase2_auto_excluded_until_review_confirmation():
+    """Full auto Samples stay out of training until review flips them to review_confirmation."""
+    with tempfile.TemporaryDirectory() as tmpdir:
+        with _isolated_backend(tmpdir) as client:
+            rec = client.post(
+                "/api/record",
+                json={
+                    "image_base64": _create_test_image_b64(color=(90, 90, 10)),
+                    "label": 1,
+                    "mode": "auto",
+                    "prediction_score": 0.88,
+                    "reviewed": 0,
+                },
+            )
+            assert rec.status_code == 201
+            auto_id = rec.json()["id"]
+
+            _, _, ids_before = db_mod.load_training_matrix(
+                return_ids=True, db_path=db_mod.DEFAULT_DB_PATH
+            )
+            assert auto_id not in ids_before
+
+            rev = client.post(
+                "/api/review",
+                json={"updates": [{"id": auto_id, "label": 1, "reviewed": 1}]},
+            )
+            assert rev.status_code == 200
+            assert rev.json()["updated_count"] == 1
+
+            rows = _samples_by_id(client)
+            assert rows[auto_id]["reviewed"] == 1
+            assert rows[auto_id]["label_provenance"] == "review_confirmation"
+
+            _, _, ids_after = db_mod.load_training_matrix(
+                return_ids=True, db_path=db_mod.DEFAULT_DB_PATH
+            )
+            assert auto_id in ids_after
+
+
+def test_phase2_exact_hash_dedup_preserves_confirmed_label():
+    """Re-recording the exact Primary image creates no second row and keeps the confirmed label."""
+    with tempfile.TemporaryDirectory() as tmpdir:
+        with _isolated_backend(tmpdir) as client:
+            img = _create_test_image_b64(color=(10, 20, 30))
+            first = client.post(
+                "/api/record",
+                json={"image_base64": img, "label": 1, "mode": "manual", "reviewed": 1},
+            )
+            assert first.status_code == 201
+            first_id = first.json()["id"]
+
+            second = client.post(
+                "/api/record",
+                json={
+                    "image_base64": img,
+                    "label": 0,
+                    "mode": "auto",
+                    "prediction_score": 0.05,
+                    "reviewed": 0,
+                },
+            )
+            assert second.status_code == 201
+            assert second.json()["status"] == "duplicate"
+            assert second.json()["id"] == first_id
+            assert second.json()["duplicate_of"] == first_id
+
+            rows = _samples_by_id(client)
+            assert len(rows) == 1
+            assert rows[first_id]["label"] == 1
+            assert rows[first_id]["reviewed"] == 1
+            assert rows[first_id]["label_provenance"] == "manual_rating"
+
+
+def test_phase2_near_match_creates_separate_sample_without_mutation():
+    """Similarity >= 0.98 on a different hash creates a separate Sample and mutates nothing."""
+    with tempfile.TemporaryDirectory() as tmpdir:
+        with _isolated_backend(tmpdir) as client:
+            canonical = np.zeros(768, dtype=np.float32)
+            canonical[0] = 1.0
+            near = canonical.copy()
+            near[1] = 0.05
+            near = near / np.linalg.norm(near)
+
+            with patch("backend.app.extract_vision_embedding") as mock_extract:
+                mock_extract.side_effect = [canonical, near]
+                first = client.post(
+                    "/api/record",
+                    json={
+                        "image_base64": _create_test_image_b64(color=(60, 60, 60)),
+                        "label": 1,
+                        "mode": "manual",
+                        "reviewed": 1,
+                    },
+                )
+                assert first.status_code == 201
+                assert first.json()["status"] == "success"
+                first_id = first.json()["id"]
+
+                second = client.post(
+                    "/api/record",
+                    json={
+                        "image_base64": _create_test_image_b64(color=(200, 30, 30)),
+                        "label": 0,
+                        "mode": "supervised",
+                        "prediction_score": 0.1,
+                        "reviewed": 1,
+                    },
+                )
+                assert second.status_code == 201
+                assert second.json()["status"] == "success"
+                second_id = second.json()["id"]
+                assert second_id != first_id
+
+            rows = _samples_by_id(client)
+            assert len(rows) == 2
+            assert rows[first_id]["label"] == 1
+            assert rows[first_id]["mode"] == "manual"
+            assert rows[first_id]["reviewed"] == 1
+            assert rows[first_id]["label_provenance"] == "manual_rating"
+            assert rows[second_id]["label"] == 0
+            assert rows[second_id]["reviewed"] == 1
+            assert rows[second_id]["label_provenance"] == "supervised_confirmation"
+
+
+def test_phase2_capture_endpoint_removed_and_cors_restricted():
+    """No /api/capture route exists and CORS allows only local dashboard origins."""
+    with tempfile.TemporaryDirectory() as tmpdir:
+        with _isolated_backend(tmpdir) as client:
+            capture_post = client.post(
+                "/api/capture", json={"x": 0, "y": 0, "width": 10, "height": 10}
+            )
+            # No API route serves desktop capture anymore (unknown paths fall
+            # through to the static mount, which answers POST with 405).
+            assert capture_post.status_code in (404, 405)
+            assert client.get("/api/capture").status_code in (404, 405)
+
+            route_paths = [
+                getattr(route, "path", "") for route in app.routes
+            ]
+            assert "/api/capture" not in route_paths
+
+            evil = client.get("/api/metrics", headers={"Origin": "https://evil.example.com"})
+            assert evil.status_code == 200
+            assert "access-control-allow-origin" not in {k.lower() for k in evil.headers}
+
+            local = client.get("/api/metrics", headers={"Origin": "http://localhost:8000"})
+            assert local.status_code == 200
+            assert local.headers.get("access-control-allow-origin") == "http://localhost:8000"
+
+
+def test_phase2_no_mss_dependency():
+    """mss usage and the desktop-capture endpoint are fully removed."""
+    requirements = (REPO_ROOT / "requirements.txt").read_text(encoding="utf-8")
+    assert not any(
+        line.strip().lower().startswith("mss") for line in requirements.splitlines()
+    )
+    backend_source = (REPO_ROOT / "backend" / "app.py").read_text(encoding="utf-8")
+    assert "import mss" not in backend_source
+    assert "/api/capture" not in backend_source
+
+
+def test_phase2_userscript_fail_closed_contract():
+    """Userscript narrows extraction to the active card and fails closed without capture."""
+    userscript = (REPO_ROOT / "userscript" / "taste_collector.user.js").read_text(
+        encoding="utf-8", errors="replace"
+    )
+    assert "@connect      *" not in userscript
+    assert "localhost" in userscript
+    assert "127.0.0.1" in userscript
+    assert "/api/capture" not in userscript
+    assert "requestScreenCapture" not in userscript
+    assert 'querySelector("canvas")' not in userscript
+    assert "main, body" not in userscript
+    assert "|| document.body" not in userscript
+    for marker in (
+        "validatePrimaryImage",
+        "revalidateCapturedArtwork",
+        "logExtractionFailure",
+        "isConnected",
+        "isAssociatedWithActiveCard",
+    ):
+        assert marker in userscript
+    assert userscript.count("revalidateCapturedArtwork") >= 6
 
 
 if __name__ == "__main__":
